@@ -203,7 +203,9 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
   -- 9. Query matches
   if ctx.query and ctx.query ~= '' then
     local matched_hl = ctx.config.hl.matched or 'IncSearch'
-    local fuzzy_highlighting = ctx.config.file_picker and ctx.config.file_picker.fuzzy_query_highlighting
+    local fuzzy_highlighting = ctx.config.file_picker
+      and ctx.config.file_picker.fuzzy_query_highlighting
+      and not ctx.config.file_picker.ordered_fuzzy_parts
 
     if not fuzzy_highlighting then
       local match_start, match_end = string.find(line_content, ctx.query, 1, true)

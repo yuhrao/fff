@@ -49,6 +49,7 @@ local function setup(geometry, opts)
           frecency = { enabled = true, db_path = %q },
           history  = { enabled = true, db_path = %q },
           logging  = { enabled = false },
+          file_picker = %s,
           debug    = {
             enabled = %s,
             show_scores = %s,
@@ -63,6 +64,7 @@ local function setup(geometry, opts)
       geometry.winborder or '',
       fixture.frecency_db,
       fixture.history_db,
+      vim.inspect(opts.file_picker),
       tostring(debug_enabled),
       tostring(debug_enabled),
       vim.inspect(show_file_info)
@@ -148,6 +150,23 @@ for _, geometry in ipairs(LAYOUTS) do
 
   T[geometry.name] = set
 end
+
+local ordered_visual_set = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      setup(LAYOUTS[2], { file_picker = { ordered_fuzzy_parts = true, fuzzy_query_highlighting = true } })
+    end,
+    post_case = teardown,
+  },
+})
+
+for _, prompt in ipairs(PROMPT_POSITIONS) do
+  ordered_visual_set['two_word_query_' .. prompt] = function()
+    open_picker(prompt, 'main helper')
+    assert_snapshot_match()
+  end
+end
+T['ordered_visual'] = ordered_visual_set
 
 -- File info panel snapshots. Timings are disabled at the config level (see
 -- `setup`) so the snapshots stay deterministic — Modified/Accessed timestamps
