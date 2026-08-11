@@ -165,6 +165,11 @@ for _, prompt in ipairs(PROMPT_POSITIONS) do
     open_picker(prompt, 'main helper')
     assert_snapshot_match()
   end
+
+  ordered_visual_set['single_word_query_' .. prompt] = function()
+    open_picker(prompt, 'main')
+    assert_snapshot_match()
+  end
 end
 T['ordered_visual'] = ordered_visual_set
 
