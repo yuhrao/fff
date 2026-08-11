@@ -374,8 +374,11 @@ require('fff').setup({
     status_text_color = false, -- true to color filenames by git status
   },
   file_picker = {
-    fuzzy_query_highlighting = false, -- true to highlight fuzzy query matches in file picker results
-    ordered_fuzzy_parts = false, -- true to require space-separated query parts ("foo bar") to match in typed order
+    -- Highlights fuzzy ranges; intentionally bypassed with ordered_fuzzy_parts for legacy picker rendering.
+    fuzzy_query_highlighting = false,
+    -- In ordered mode, space-separated query chunks (for example, "foo bar") are
+    -- strict in-order subsequences; chunk typos are not corrected.
+    ordered_fuzzy_parts = false,
   },
   select = {
     -- Return winid to open the chosen file in, or nil to open in the original window

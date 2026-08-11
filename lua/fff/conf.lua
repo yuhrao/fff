@@ -425,10 +425,10 @@ local function init()
     -- find_files settings
     file_picker = {
       current_file_label = '(current)',
+      -- Highlights fuzzy ranges; intentionally bypassed with ordered_fuzzy_parts for legacy picker rendering.
       fuzzy_query_highlighting = false,
-      -- Require space-separated fuzzy query parts (e.g. "foo bar") to match in the
-      -- order they were typed, as a single fuzzy subsequence, instead of each part
-      -- matching independently anywhere in the candidate. Off by default.
+      -- In ordered mode, space-separated query chunks (for example, "foo bar") are
+      -- strict in-order subsequences; chunk typos are not corrected.
       ordered_fuzzy_parts = false,
     },
     -- grep settings
