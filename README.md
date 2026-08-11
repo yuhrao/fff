@@ -295,6 +295,9 @@ require('fff').setup({
   lazy_sync = true,
   prompt_vim_mode = false,
   follow_symlinks = false,
+  -- Set true to include hidden files/directories for non-git roots. Git roots already include
+  -- hidden non-ignored files; existing ignore rules apply and .git internals stay excluded.
+  show_hidden = false,
   -- Allow indexing the user's $HOME directory. Enabled by default.
   -- Disable if you strictly sure you don't want this, as it makes whole fff error hard
   enable_home_dir_scanning = true,
