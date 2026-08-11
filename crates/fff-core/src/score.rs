@@ -42,26 +42,6 @@ fn resolve_file_chunks(
     Some((ptrs.len(), file.path.byte_len))
 }
 
-/// Join already-length-filtered fuzzy parts into a single ordered-match
-/// needle, when there's more than one meaningful part. Concatenates without
-/// a separator: candidate paths rarely contain a literal join character
-/// (unlike grep, which matches free-form text where a literal space is
-/// common), and spending typo budget on a synthetic separator would weaken
-/// real typo tolerance for the parts themselves. Returns `None` when
-/// there's nothing to join (0 or 1 valid parts), so callers fall back to
-/// their normal single/empty-part handling — the exact same handling
-/// unordered mode already uses for these cases.
-///
-/// Callers must pass parts already filtered the same way `match_fuzzy_parts`
-/// filters `valid_parts` (`len() >= 2`), so the needle used for scoring and
-/// the needle used for highlight recomputation are always identical.
-fn join_ordered_parts(valid_parts: &[&str]) -> Option<String> {
-    if valid_parts.len() < 2 {
-        return None;
-    }
-    Some(valid_parts.concat())
-}
-
 #[inline]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
@@ -212,21 +192,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         _ => Vec::new(),
     };
 
-    // Mirror the scoring pass: highlight the same single joined-needle match
-    // (via the shared `join_ordered_parts` helper) so ranges stay consistent
-    // with an ordered-mode score.
-    let joined_query;
-    let parts: Vec<&str> = if ordered {
-        match join_ordered_parts(&valid_parts) {
-            Some(joined) => {
-                joined_query = joined;
-                vec![joined_query.as_str()]
-            }
-            None => valid_parts,
-        }
-    } else {
-        valid_parts
-    };
+    let parts = valid_parts;
 
     let mut ranges_by_item = vec![SmallVec::new(); items.len()];
     if parts.is_empty() || items.is_empty() {
@@ -273,6 +239,9 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
             let Some(path) = paths.get(item_idx) else {
                 continue;
             };
+            if ordered && !matches_ordered_fuzzy_parts(&parts, path) {
+                continue;
+            }
 
             matched.indices.sort_unstable();
             ranges_by_item[item_idx].extend(char_indices_to_byte_offsets(path, &matched.indices));
@@ -472,25 +441,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         }
     };
 
-    let joined_query;
-    let joined_query_ref: &str;
-    let fuzzy_parts: &[&str] = if ordered_fuzzy_parts {
-        let valid_for_join: Vec<&str> = raw_fuzzy_parts
-            .iter()
-            .copied()
-            .filter(|p| p.len() >= 2)
-            .collect();
-        match join_ordered_parts(&valid_for_join) {
-            Some(joined) => {
-                joined_query = joined;
-                joined_query_ref = joined_query.as_str();
-                std::slice::from_ref(&joined_query_ref)
-            }
-            None => raw_fuzzy_parts,
-        }
-    } else {
-        raw_fuzzy_parts
-    };
+    let fuzzy_parts = raw_fuzzy_parts;
 
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -517,7 +468,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         ..Default::default()
     };
 
-    let path_matches = match_fuzzy_parts_dirs(
+    let mut path_matches = match_fuzzy_parts_dirs(
         fuzzy_parts,
         &working_dirs,
         &options,
@@ -525,6 +476,21 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         arena,
         overflow_arena,
     );
+    if ordered_fuzzy_parts {
+        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        path_matches.retain(|path_match| {
+            let dir = working_dirs[path_match.index as usize];
+            let dir_arena = if dir.is_overflow() {
+                overflow_arena
+            } else {
+                arena
+            };
+            matches_ordered_fuzzy_parts(
+                fuzzy_parts,
+                dir.read_relative_path(dir_arena, &mut path_buf),
+            )
+        });
+    }
 
     let main_needle = valid_parts[0].as_bytes();
     let main_needle_len = main_needle.len() as u16;
@@ -702,31 +668,7 @@ fn match_and_score_in_arena<'a>(
 
     debug_assert!(!raw_fuzzy_parts.is_empty());
 
-    // Ordered mode: join length-filtered parts into one needle and reuse the
-    // existing single-needle match path (same as a single-token query) so
-    // multi-word queries require their parts as one in-order fuzzy
-    // subsequence. Filtering before joining (rather than after) keeps this
-    // needle identical to the one `fuzzy_match_byte_offsets_for_page` builds
-    // for highlights, via the shared `join_ordered_parts` helper.
-    let joined_query;
-    let joined_query_ref: &str;
-    let fuzzy_parts: &[&str] = if ordered_fuzzy_parts {
-        let valid_for_join: Vec<&str> = raw_fuzzy_parts
-            .iter()
-            .copied()
-            .filter(|p| p.len() >= 2)
-            .collect();
-        match join_ordered_parts(&valid_for_join) {
-            Some(joined) => {
-                joined_query = joined;
-                joined_query_ref = joined_query.as_str();
-                std::slice::from_ref(&joined_query_ref)
-            }
-            None => raw_fuzzy_parts,
-        }
-    } else {
-        raw_fuzzy_parts
-    };
+    let fuzzy_parts = raw_fuzzy_parts;
 
     let has_uppercase = fuzzy_parts
         .iter()
@@ -748,13 +690,20 @@ fn match_and_score_in_arena<'a>(
         ..Default::default()
     };
 
-    let path_matches = match_fuzzy_parts(
+    let mut path_matches = match_fuzzy_parts(
         fuzzy_parts,
         &working_files,
         &options,
         context.max_threads,
         arena,
     );
+    if ordered_fuzzy_parts {
+        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        path_matches.retain(|path_match| {
+            let file = working_files.index(path_match.index as usize);
+            matches_ordered_fuzzy_parts(fuzzy_parts, file.path.read_to_buf(arena, &mut path_buf))
+        });
+    }
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
@@ -1376,6 +1325,25 @@ mod filename_bonus_tests {
         (result, arena)
     }
 
+    fn make_dirs(paths: &[&str]) -> (Vec<DirItem>, ArenaPtr) {
+        let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(paths.len());
+        let dirs = paths
+            .iter()
+            .map(|path| {
+                let chunked = builder.add_dir_immediate(path);
+                let last_segment_offset = path
+                    .rfind(std::path::is_separator)
+                    .map(|i| i + 1)
+                    .unwrap_or(0) as u16;
+                DirItem::new(chunked, last_segment_offset)
+            })
+            .collect();
+        let store = builder.finish();
+        let arena = store.as_arena_ptr();
+        std::mem::forget(store);
+        (dirs, arena)
+    }
+
     fn make_files_with_frecency(specs: &[(&str, i16)]) -> (Vec<FileItem>, ArenaPtr) {
         let path_strings: Vec<String> = specs.iter().map(|(p, _)| p.to_string()).collect();
         let items: Vec<FileItem> = specs
@@ -1469,6 +1437,36 @@ mod filename_bonus_tests {
             .collect()
     }
 
+    fn search_ordered_dirs(dirs: &[DirItem], query: &str, arena: ArenaPtr) -> Vec<(String, Score)> {
+        let parser = QueryParser::default();
+        let parsed = parser.parse(query);
+        let effective_query = match &parsed.fuzzy_query {
+            FuzzyQuery::Text(t) => *t,
+            FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
+            _ => query,
+        };
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos: (effective_query.len() as u16 / 4).clamp(2, 6),
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 100,
+            },
+        };
+        let (items, scores, _) = fuzzy_match_and_score_dirs(dirs, &ctx, arena, arena, true);
+        items
+            .iter()
+            .zip(scores.iter())
+            .map(|(dir, score)| (dir.relative_path(arena), score.clone()))
+            .collect()
+    }
+
     #[test]
     fn test_ordered_fuzzy_parts_off_matches_parts_unordered() {
         // Default (off) behavior: each part is an independent AND filter,
@@ -1486,9 +1484,7 @@ mod filename_bonus_tests {
 
     #[test]
     fn test_ordered_fuzzy_parts_on_requires_typed_order() {
-        // Ordered mode: "handler auth" must appear as one in-order
-        // subsequence. "src/handler/auth.rs" has handler before auth (matches);
-        // "auth/src/handler.rs" has auth before handler (must NOT match).
+        // Each chunk must be a subsequence after the preceding chunk.
         let (files, arena) = make_files(&["src/handler/auth.rs", "auth/src/handler.rs"]);
 
         let results = search_ordered(&files, "handler auth", arena);
@@ -1502,17 +1498,27 @@ mod filename_bonus_tests {
     }
 
     #[test]
+    fn test_ordered_fuzzy_parts_rejects_reversed_chunks_despite_typos() {
+        let (files, arena) = make_files(&["ab_cd.rs", "cd_ab.rs", "ax_cd.rs"]);
+
+        let results = search_ordered(&files, "ab cd", arena);
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["ab_cd.rs"],
+            "ordered mode admitted a reversed or typo-corrected chunk: {results:?}"
+        );
+    }
+
+    #[test]
     fn test_ordered_fuzzy_parts_no_literal_space_required_in_candidate() {
-        // Regression: the joined ordered-mode needle must NOT require a
-        // literal space character in the candidate. Candidate paths spell
-        // each word's letters with separators between them but never
-        // contain a space — "alp bet" joined WITH a space (`"alp bet"`)
-        // would burn typo budget on a needle character ('  ') that can
-        // never match a path, weakening real typo tolerance. Joining
-        // without a separator (`"alpbet"`) has no such cost.
+        // Query spaces separate chunks; candidates need no literal spaces.
         let (files, arena) = make_files(&[
-            "a_l_p_xx_b_e_t.rs",  // "alp" then "bet", in typed order
-            "b_e_t_xx_a_l_p.rs",  // "bet" then "alp", reversed
+            "a_l_p_xx_b_e_t.rs", // "alp" then "bet", in typed order
+            "b_e_t_xx_a_l_p.rs", // "bet" then "alp", reversed
         ]);
 
         let results = search_ordered(&files, "alp bet", arena);
@@ -1527,12 +1533,7 @@ mod filename_bonus_tests {
 
     #[test]
     fn test_ordered_fuzzy_parts_many_short_parts_still_match() {
-        // Empirically motivates joining without a separator: a space-joined
-        // needle for this query ("ab cd ef gh" -> 11 chars incl. 3 literal
-        // spaces) burns 3 of its 2-typo budget on spaces that can never
-        // match a path, and the match is dropped entirely. Joining without
-        // a separator ("abcdefgh") spends 0 budget on synthetic characters
-        // and matches cleanly.
+        // Every chunk may span path separators without consuming typo budget.
         let (files, arena) = make_files(&["ab_cd_ef_gh.rs"]);
         let results = search_ordered(&files, "ab cd ef gh", arena);
         assert!(
@@ -1627,10 +1628,92 @@ mod filename_bonus_tests {
         let offsets =
             fuzzy_match_byte_offsets_for_page(&parsed, &items, ctx.max_typos, arena, arena, true);
         assert_eq!(offsets.len(), 1);
-        assert!(
-            !offsets[0].is_empty(),
-            "ordered-mode highlight ranges must be produced for the matched item"
+        assert_eq!(offsets[0].as_slice(), &[(4, 11), (12, 16)]);
+    }
+
+    #[test]
+    fn test_ordered_fuzzy_parts_single_valid_chunk_keeps_typo_tolerance() {
+        let (files, arena) = make_files(&["ac.rs"]);
+
+        let results = search_ordered(&files, "ab x", arena);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "ac.rs");
+    }
+
+    #[test]
+    fn test_ordered_fuzzy_parts_dirs_require_typed_order() {
+        let (dirs, arena) = make_dirs(&["src/handler/auth", "auth/src/handler"]);
+
+        let results = search_ordered_dirs(&dirs, "handler auth", arena);
+
+        assert_eq!(
+            results.len(),
+            1,
+            "unexpected directory matches: {results:?}"
         );
+        assert_eq!(results[0].0, "src/handler/auth");
+    }
+
+    #[test]
+    fn test_ordered_fuzzy_parts_dirs_reject_reversed_and_typo_chunks() {
+        let (dirs, arena) = make_dirs(&["ab_cd", "cd_ab", "ax_cd"]);
+
+        let results = search_ordered_dirs(&dirs, "ab cd", arena);
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["ab_cd"],
+            "ordered mode admitted a reversed or typo-corrected directory: {results:?}"
+        );
+    }
+
+    #[test]
+    fn test_ordered_fuzzy_parts_dirs_ignore_repeated_whitespace() {
+        let (dirs, arena) = make_dirs(&["src/handler/auth", "auth/src/handler"]);
+
+        let collapsed = search_ordered_dirs(&dirs, "handler auth", arena);
+        let spaced = search_ordered_dirs(&dirs, "handler   auth", arena);
+
+        assert_eq!(
+            collapsed.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            spaced.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_ordered_fuzzy_parts_dirs_combine_with_constraints() {
+        let (dirs, arena) = make_dirs(&[
+            "keep/src/handler/auth",
+            "drop/src/handler/auth",
+            "keep/auth/src/handler",
+        ]);
+
+        let results = search_ordered_dirs(&dirs, "/keep/ handler auth", arena);
+
+        assert_eq!(
+            results.len(),
+            1,
+            "unexpected directory matches: {results:?}"
+        );
+        assert_eq!(results[0].0, "keep/src/handler/auth");
+    }
+
+    #[test]
+    fn test_ordered_fuzzy_parts_dirs_preserve_smart_case_bonus() {
+        let (dirs, arena) = make_dirs(&["src/AuthHandler", "src/authhandler_other"]);
+
+        let results = search_ordered_dirs(&dirs, "Auth Handler", arena);
+
+        assert_eq!(
+            results.len(),
+            2,
+            "both case variants should match: {results:?}"
+        );
+        assert_eq!(results[0].0, "src/AuthHandler");
     }
 
     #[test]
@@ -2037,4 +2120,24 @@ mod constraint_only_query_tests {
         assert_eq!(total_matched, 1);
         assert_eq!(items[0].relative_path(arena), "a.rs");
     }
+}
+
+fn matches_ordered_fuzzy_parts(parts: &[&str], candidate: &str) -> bool {
+    if parts.iter().filter(|part| part.len() >= 2).take(2).count() < 2 {
+        return true;
+    }
+
+    // ponytail: ordered chunks are strict subsequences; add typo correction only if required.
+    let mut candidate_chars = candidate.chars();
+    for part in parts.iter().copied().filter(|part| part.len() >= 2) {
+        for needle_char in part.chars() {
+            if !candidate_chars.any(|candidate_char| {
+                needle_char == candidate_char
+                    || needle_char.to_lowercase().eq(candidate_char.to_lowercase())
+            }) {
+                return false;
+            }
+        }
+    }
+    true
 }
