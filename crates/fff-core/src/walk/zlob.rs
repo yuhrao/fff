@@ -17,13 +17,16 @@ pub(crate) fn walk_collect_files(
     base_path: &Path,
     is_git_repo: bool,
     follow_symlinks: bool,
+    show_hidden: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
 ) -> crate::Result<WalkOutput> {
     // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
-    // ~/.cache, ~/.config, etc.); optionally follow symlinks.
+    // ~/.cache, ~/.config, etc.) unless the caller opted into `show_hidden`;
+    // optionally follow symlinks. Git roots already show hidden files today,
+    // gated solely by gitignore, regardless of `show_hidden`.
     let mut flags = WalkFlags::GITIGNORE;
-    if !is_git_repo {
+    if !is_git_repo && !show_hidden {
         flags |= WalkFlags::SKIP_HIDDEN;
     }
     if follow_symlinks {

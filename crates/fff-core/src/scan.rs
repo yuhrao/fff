@@ -40,6 +40,7 @@ pub(crate) struct ScanConfig {
     pub(crate) follow_symlinks: bool,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
+    pub(crate) show_hidden: bool,
 }
 
 /// A fully-configured scan job ready to run on a background thread.
@@ -93,6 +94,7 @@ impl ScanJob {
             follow_symlinks: picker.follows_symlinks(),
             enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
+            show_hidden: picker.shows_hidden(),
         };
 
         drop(guard); // just a sanity check
@@ -173,6 +175,7 @@ impl ScanJob {
             &shared_frecency,
             mode,
             config.follow_symlinks,
+            config.show_hidden,
         ) {
             Ok(sync) => sync,
             Err(e) => {

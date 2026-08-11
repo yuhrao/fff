@@ -91,7 +91,7 @@ mod tests {
         fs::write(root.join("target/out.bin"), "bin").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
+        let out = walk_collect_files(root, true, false, false, 1, &counter).unwrap();
 
         let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
         names.sort();
@@ -115,11 +115,136 @@ mod tests {
         fs::write(root.join("index.js"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, false, false, 1, &counter).unwrap();
+        let out = walk_collect_files(root, false, false, false, 1, &counter).unwrap();
         let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
 
         assert!(names.iter().any(|n| n.ends_with("index.js")));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
+    }
+
+    // show_hidden=false (the default) on a non-git root excludes dotfiles
+    // and hidden directories, same as today.
+    #[test]
+    fn show_hidden_false_excludes_dotfiles_on_non_git_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".env"), "SECRET=1").unwrap();
+        fs::create_dir(root.join(".config")).unwrap();
+        fs::write(root.join(".config/settings.json"), "{}").unwrap();
+        fs::write(root.join("index.js"), "x").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, false, false, false, 1, &counter).unwrap();
+        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+
+        assert!(names.iter().any(|n| n.ends_with("index.js")));
+        assert!(!names.iter().any(|n| n.ends_with(".env")));
+        assert!(!names.iter().any(|n| n.contains(".config")));
+    }
+
+    // show_hidden=true on a non-git root includes dotfiles and files under
+    // hidden directories.
+    #[test]
+    fn show_hidden_true_includes_dotfiles_on_non_git_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".env"), "SECRET=1").unwrap();
+        fs::create_dir(root.join(".config")).unwrap();
+        fs::write(root.join(".config/settings.json"), "{}").unwrap();
+        fs::write(root.join("index.js"), "x").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, false, false, true, 1, &counter).unwrap();
+        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+
+        assert!(names.iter().any(|n| n.ends_with("index.js")));
+        assert!(names.iter().any(|n| n.ends_with(".env")));
+        assert!(names.iter().any(|n| n.ends_with("settings.json")));
+        assert_eq!(counter.load(Ordering::Relaxed), names.len());
+    }
+
+    // show_hidden=true still respects standalone `.ignore` files (the ripgrep
+    // convention that, unlike `.gitignore`, applies without needing an actual
+    // `.git` directory nearby — the only ignore-file mechanism this walker
+    // honors on a genuinely non-git root today). A hidden file matched by
+    // `.ignore` stays excluded; a non-matched hidden file is included.
+    #[test]
+    fn show_hidden_true_still_respects_dot_ignore_file_on_non_git_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".ignore"), ".env.ignored\n").unwrap();
+        fs::write(root.join(".env.ignored"), "SECRET=1").unwrap();
+        fs::write(root.join(".env.local"), "OTHER=1").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, false, false, true, 1, &counter).unwrap();
+        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+
+        assert!(names.iter().any(|n| n.ends_with(".env.local")));
+        assert!(!names.iter().any(|n| n.ends_with(".env.ignored")));
+    }
+
+    // show_hidden must not weaken the non-code-directory pruning (the actual
+    // ignore mechanism a genuinely non-git root relies on today) even when
+    // the pruned directory is itself hidden.
+    #[test]
+    fn show_hidden_true_still_prunes_non_code_dirs_under_hidden_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".config/node_modules")).unwrap();
+        fs::write(root.join(".config/node_modules/lib.js"), "x").unwrap();
+        fs::write(root.join(".config/settings.json"), "{}").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, false, false, true, 1, &counter).unwrap();
+        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+
+        assert!(names.iter().any(|n| n.ends_with("settings.json")));
+        assert!(!names.iter().any(|n| n.contains("node_modules")));
+    }
+
+    // show_hidden=true never surfaces .git internals, even on a non-git-repo
+    // walk (e.g. a stray/unrelated .git directory under the indexed root).
+    #[test]
+    fn show_hidden_true_never_includes_git_internals() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config"), "[core]").unwrap();
+        fs::write(root.join("index.js"), "x").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let out = walk_collect_files(root, false, false, true, 1, &counter).unwrap();
+        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+
+        assert!(names.iter().any(|n| n.ends_with("index.js")));
+        assert!(!names.iter().any(|n| n.contains(".git/")));
+    }
+
+    // show_hidden must not change git-repo behavior: git roots already show
+    // hidden (non-ignored) files today regardless of this flag.
+    #[test]
+    fn show_hidden_does_not_change_git_root_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".env"), "SECRET=1").unwrap();
+        fs::write(root.join("Cargo.toml"), "x").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let off = walk_collect_files(root, true, false, false, 1, &counter).unwrap();
+        let mut off_names: Vec<String> = off.pairs.into_iter().map(|(_, rel)| rel).collect();
+        off_names.sort();
+
+        let on = walk_collect_files(root, true, false, true, 1, &counter).unwrap();
+        let mut on_names: Vec<String> = on.pairs.into_iter().map(|(_, rel)| rel).collect();
+        on_names.sort();
+
+        assert_eq!(
+            off_names, on_names,
+            "show_hidden must be a no-op on git roots"
+        );
+        assert!(off_names.iter().any(|n| n.ends_with(".env")));
     }
 
     // Only the zlob backend surfaces reusable ignore rules; they must match
@@ -136,7 +261,7 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "x").unwrap();
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
+        let out = walk_collect_files(root, true, false, false, 1, &counter).unwrap();
 
         let rules = out.ignore_rules.expect("zlob surfaces ignore rules");
         assert!(rules.is_ignored(Path::new("target/")));

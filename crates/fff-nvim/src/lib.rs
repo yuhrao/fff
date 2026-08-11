@@ -68,6 +68,7 @@ struct PickerInitOpts {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     enable_filename_constraint: bool,
+    show_hidden: bool,
 }
 
 impl PickerInitOpts {
@@ -92,6 +93,7 @@ impl PickerInitOpts {
                 enable_filename_constraint: t
                     .get::<Option<bool>>("enable_filename_constraint")?
                     .unwrap_or(false),
+                show_hidden: t.get::<Option<bool>>("show_hidden")?.unwrap_or(false),
             }),
             other => Err(LuaError::RuntimeError(format!(
                 "init opts must be a table, boolean, or nil — got {}",
@@ -128,6 +130,7 @@ pub fn init_file_picker(
             follow_symlinks: opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
+            show_hidden: opts.show_hidden,
             ..Default::default()
         },
     )
@@ -175,7 +178,7 @@ pub fn restart_index_in_path(
         // Inherit current picker's scanning flags when caller didn't pass
         // explicit opts — otherwise a `:cd ~` after init would silently lose
         // the user's `enable_home_dir_scanning = true` setting.
-        let (follow_symlinks, fs_root, home_dir) = {
+        let (follow_symlinks, fs_root, home_dir, show_hidden) = {
             let guard = match FILE_PICKER.read() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -193,11 +196,13 @@ pub fn restart_index_in_path(
                     p.follows_symlinks() || opts.follow_symlinks,
                     p.fs_root_scanning_enabled() || opts.enable_fs_root_scanning,
                     p.home_dir_scanning_enabled() || opts.enable_home_dir_scanning,
+                    p.shows_hidden() || opts.show_hidden,
                 ),
                 None => (
                     opts.follow_symlinks,
                     opts.enable_fs_root_scanning,
                     opts.enable_home_dir_scanning,
+                    opts.show_hidden,
                 ),
             }
         };
@@ -220,6 +225,7 @@ pub fn restart_index_in_path(
                 follow_symlinks,
                 enable_fs_root_scanning: fs_root,
                 enable_home_dir_scanning: home_dir,
+                show_hidden,
                 ..Default::default()
             },
         ) {

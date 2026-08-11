@@ -266,6 +266,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
             follow_symlinks: opts.version >= 2 && opts.follow_symlinks,
             enable_fs_root_scanning: opts.enable_fs_root_scanning,
             enable_home_dir_scanning: opts.enable_home_dir_scanning,
+            show_hidden: false,
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -955,6 +956,7 @@ pub unsafe extern "C" fn fff_restart_index(
             follow_symlinks,
             enable_fs_root_scanning: fs_root,
             enable_home_dir_scanning: home_dir,
+            show_hidden: false,
         },
     ) {
         Ok(()) => FffResult::ok_empty(),

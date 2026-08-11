@@ -252,6 +252,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning,
                     enable_home_dir_scanning,
+                    show_hidden: false,
                 },
             )
             .map_err(py_err)
@@ -847,6 +848,7 @@ impl FileFinder {
                     follow_symlinks,
                     enable_fs_root_scanning: fs_root,
                     enable_home_dir_scanning: home_dir,
+                    show_hidden: false,
                 },
             )
             .map_err(py_err)

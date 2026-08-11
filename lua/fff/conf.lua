@@ -79,6 +79,7 @@ local M = {}
 --- @field follow_symlinks boolean
 --- @field enable_fs_root_scanning boolean
 --- @field enable_home_dir_scanning boolean
+--- @field show_hidden boolean
 --- @field layout FffLayoutConfig
 --- @field preview FffPreviewConfig
 --- @field keymaps FffKeymapsConfig
@@ -221,6 +222,12 @@ local function init()
     enable_home_dir_scanning = true,
     -- Allow fff in a filesystem root (e.g. `/`, `C:\`)
     enable_fs_root_scanning = false,
+    -- Include dotfiles and files under hidden directories when indexing a
+    -- non-git root. Git roots are unaffected (they already show hidden,
+    -- non-ignored files). Ignore rules (`.ignore` files, built-in noisy-dir
+    -- pruning) and `.git/` internals are always respected regardless of
+    -- this setting.
+    show_hidden = false,
     layout = {
       height = 0.8,
       width = 0.8,

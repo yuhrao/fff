@@ -14,13 +14,16 @@ pub(crate) fn walk_collect_files(
     base_path: &Path,
     is_git_repo: bool,
     follow_symlinks: bool,
+    show_hidden: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
 ) -> crate::Result<WalkOutput> {
     let mut walk_builder = WalkBuilder::new(base_path);
     walk_builder
-        // this is a very important guard for the user opening ~/ or other root non-git dir
-        .hidden(!is_git_repo)
+        // this is a very important guard for the user opening ~/ or other root non-git dir.
+        // `show_hidden` only relaxes it outside a git repo — git roots already show hidden
+        // files today (gated solely by .gitignore/.git_exclude/.git_global below).
+        .hidden(!is_git_repo && !show_hidden)
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true)

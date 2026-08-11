@@ -548,6 +548,11 @@ pub struct FilePickerOptions {
     /// Allow indexing the user's home directory. Off by default for the same
     /// reason as `enable_fs_root_scanning`
     pub enable_home_dir_scanning: bool,
+    /// Include dotfiles and files under hidden directories when indexing a
+    /// non-git root. Git roots are unaffected — they already show hidden
+    /// (non-ignored) files today. `.gitignore`/global ignore rules and
+    /// `.git/` internals are always respected regardless of this setting.
+    pub show_hidden: bool,
 }
 
 impl Default for FilePickerOptions {
@@ -562,6 +567,7 @@ impl Default for FilePickerOptions {
             follow_symlinks: false,
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
+            show_hidden: false,
         }
     }
 }
@@ -585,6 +591,7 @@ pub struct FilePicker {
     follow_symlinks: bool,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
+    show_hidden: bool,
     trace_span: tracing::Span,
     trace_id: String,
 }
@@ -658,6 +665,10 @@ impl FilePicker {
 
     pub fn fs_root_scanning_enabled(&self) -> bool {
         self.enable_fs_root_scanning
+    }
+
+    pub fn shows_hidden(&self) -> bool {
+        self.show_hidden
     }
 
     pub fn home_dir_scanning_enabled(&self) -> bool {
@@ -898,6 +909,7 @@ impl FilePicker {
             follow_symlinks: options.follow_symlinks,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
+            show_hidden: options.show_hidden,
             trace_span,
             trace_id,
         })
@@ -927,6 +939,7 @@ impl FilePicker {
         let follow_symlinks = picker.follow_symlinks;
         let enable_fs_root_scanning = picker.enable_fs_root_scanning;
         let enable_home_dir_scanning = picker.enable_home_dir_scanning;
+        let show_hidden = picker.show_hidden;
 
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
@@ -969,6 +982,7 @@ impl FilePicker {
                 follow_symlinks,
                 enable_fs_root_scanning,
                 enable_home_dir_scanning,
+                show_hidden,
             },
         )
         .spawn();
@@ -999,6 +1013,7 @@ impl FilePicker {
             &empty_frecency,
             self.mode,
             self.follow_symlinks,
+            self.show_hidden,
         )?;
 
         self.sync_data = sync;
@@ -1307,7 +1322,8 @@ impl FilePicker {
             },
             ..options
         };
-        let dir_results = self.fuzzy_search_directories_impl(query, dir_options, ordered_fuzzy_parts);
+        let dir_results =
+            self.fuzzy_search_directories_impl(query, dir_options, ordered_fuzzy_parts);
 
         if dirs_only {
             let total_matched = dir_results.total_matched;
@@ -1351,7 +1367,8 @@ impl FilePicker {
             },
             ..options
         };
-        let file_results = self.fuzzy_search_impl(query, query_tracker, file_options, ordered_fuzzy_parts);
+        let file_results =
+            self.fuzzy_search_impl(query, query_tracker, file_options, ordered_fuzzy_parts);
 
         // Merge by score descending.
         let total_matched = file_results.total_matched + dir_results.total_matched;
@@ -2090,6 +2107,7 @@ impl FileSync {
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
         follow_symlinks: bool,
+        show_hidden: bool,
     ) -> Result<FileSync, Error> {
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
@@ -2102,6 +2120,7 @@ impl FileSync {
             base_path,
             is_git_repo,
             follow_symlinks,
+            show_hidden,
             bg_threads,
             synced_files_count,
         )?;
