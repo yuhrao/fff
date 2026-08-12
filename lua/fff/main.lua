@@ -26,6 +26,18 @@ function M.find_files(opts)
   picker_ui.open(opts)
 end
 
+--- Open a picker over the currently open (listed) buffers, reusing the same
+--- file-picker UI as find_files (same visual, source = open buffers only).
+--- @param opts? table Optional configuration overrides (same as find_files)
+function M.buffers(opts)
+  local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
+  if not picker_ok then
+    vim.notify('Failed to load picker UI: ' .. picker_ui, vim.log.levels.ERROR)
+    return
+  end
+  picker_ui.open(vim.tbl_deep_extend('force', { mode = 'buffers' }, opts or {}))
+end
+
 --- Live grep: search file contents in the current directory.
 --- When opts.resume is true, resumes the last live_grep picker (or opens a new one if none saved).
 --- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides

@@ -14,6 +14,60 @@ function M.init(parent_module) P = parent_module end
 -- Convenience alias
 local S = picker_ui_state.state
 
+--- Build FileItem-shaped entries for all listed, loaded, named buffers.
+--- @return table[] items
+local function get_buffer_items()
+  local items = {}
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.bo[buf].buflisted and vim.api.nvim_buf_is_loaded(buf) then
+      local path = vim.api.nvim_buf_get_name(buf)
+      if path ~= '' and vim.fn.filereadable(path) == 1 then
+        table.insert(items, {
+          path = path,
+          relative_path = path,
+          name = vim.fn.fnamemodify(path, ':t'),
+          extension = vim.fn.fnamemodify(path, ':e'),
+          directory = vim.fn.fnamemodify(path, ':h'),
+          size = 0,
+          modified = 0,
+          total_frecency_score = 0,
+          access_frecency_score = 0,
+          modification_frecency_score = 0,
+          git_status = nil,
+        })
+      end
+    end
+  end
+  return items
+end
+
+--- Fuzzy-match open buffers (same picker UI as find_files, source = open buffers).
+--- @param query string
+--- @param offset number 0-based page offset
+--- @param limit number
+--- @return table, number items, total_matched
+local function search_buffers(query, offset, limit)
+  local items = get_buffer_items()
+  local matched = items
+  if query ~= '' then
+    local paths = vim.tbl_map(function(i) return i.relative_path end, items)
+    local hits = vim.fn.matchfuzzypos(paths, query)
+    local matched_paths = hits and hits[1] or {}
+    local by_path = {}
+    for _, it in ipairs(items) do by_path[it.relative_path] = it end
+    matched = {}
+    for _, p in ipairs(matched_paths) do
+      if by_path[p] then table.insert(matched, by_path[p]) end
+    end
+  end
+  local total = #matched
+  local page = {}
+  for i = offset + 1, math.min(offset + limit, total) do
+    table.insert(page, matched[i])
+  end
+  return page, total
+end
+
 function M.update_results() M.update_results_sync() end
 
 function M.update_results_sync()
@@ -62,6 +116,9 @@ function M.update_results_sync()
       end
     end
     S.location = nil
+  elseif S.mode == 'buffers' then
+    results, S.pagination.total_matched = search_buffers(S.query, 0, page_size)
+    S.location = nil
   else
     results = file_picker.search_files_paginated(
       S.query,
@@ -81,7 +138,7 @@ function M.update_results_sync()
 
   S.suggestion_items = nil
   S.suggestion_source = nil
-  if #results == 0 and S.query ~= '' then
+  if #results == 0 and S.query ~= '' and S.mode ~= 'buffers' then
     if S.mode == 'grep' then
       local suggestion_results =
         file_picker.search_files_paginated(S.query, S.current_file_cache, S.config.max_threads, nil, 0, page_size)
@@ -142,6 +199,8 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
         S.pagination.grep_file_offsets[new_page_index + 2] = grep_result.next_file_offset
       end
     end
+  elseif S.mode == 'buffers' then
+    results, S.pagination.total_matched = search_buffers(S.query, new_page_index * page_size, page_size)
   else
     ok, results = pcall(
       file_picker.search_files_paginated,
@@ -161,7 +220,7 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
 
   if #results == 0 then return false end
 
-  if S.mode ~= 'grep' then
+  if S.mode ~= 'grep' and S.mode ~= 'buffers' then
     local metadata = file_picker.get_search_metadata()
     S.pagination.total_matched = metadata.total_matched
   end
