@@ -15,6 +15,27 @@ Originally started as [Neovim plugin](#neovim-plugin) people loved, but it turne
 
 ---
 
+## Sponsors
+
+fff is MIT and open source forever. Development is supported by these companies:
+
+<table>
+  <tr>
+    <td align="center" width="110"><sub><b>💎<br>DIAMOND</b></sub></td>
+    <td align="center" width="420"><a href="https://anoma.ly"><img alt="Anomaly" src="./assets/sponsors/anomaly.png" width="400"></a></td>
+    <td><b><a href="https://anoma.ly">Anomaly</a></b><br><sub>The team behind <a href="https://opencode.ai">opencode</a>.</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>🥇<br>GOLD</b></sub></td>
+    <td align="center"><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github"><img alt="Mango Proxy" src="./assets/sponsors/mango-proxy.png" width="280"></a></td>
+    <td><b><a href="https://mangoproxy.com/?utm_source=dmtrkovalenko&utm_medium=partner&utm_campaign=dmtrkovalenko_github">Mango Proxy</a></b><br><sub>Fast, secure proxies for all the needs.</sub></td>
+  </tr>
+</table>
+
+<sub>Use and enjoy fff? <a href="mailto:dmitriy@iusevimbtw.com">Become a sponsor to get your features/fixes the highest priority</a>.</sub>
+
+---
+
 Pick what you are interested in:
 
 <details id="mcp-server">
@@ -277,6 +298,17 @@ Both `file_search` and `content_search` honour an optional `cwd` field. The firs
 - If the index is still warming up after a `change_indexing_directory`, you can pass `wait_for_index_ms = N` to block for up to `N` ms regardless of whether `cwd` triggered the swap. Pass `0` to skip waiting entirely (useful for fire-and-forget calls where partial results are acceptable).
 - Invalid or non-existent `cwd` paths return an empty result and emit an error via `vim.notify`.
 
+### Autocmds
+
+The picker fires `User` autocmds when it opens and closes. `FFFOpen` runs with the prompt window focused, `FFFClose` runs after every picker window is gone — so hide global UI, not window-local options of the picker itself:
+
+```lua
+vim.api.nvim_create_autocmd('User', {
+  pattern = { 'FFFOpen', 'FFFClose' },
+  callback = function(ev) vim.o.showtabline = ev.match == 'FFFOpen' and 0 or 2 end,
+})
+```
+
 ### Commands
 
 - `:FFFScan`. Rescan files.
@@ -293,12 +325,13 @@ Defaults are sensible. Override only what you care about.
 ```lua
 require('fff').setup({
   base_path = vim.fn.getcwd(),
-  prompt = '> ',
+  prompt = '🪿 ',
   title = 'FFFiles',
   max_results = 100,
   max_threads = 4,
   lazy_sync = true,
   prompt_vim_mode = false,
+  wrap_around = false, -- true to wrap the cursor around when moving past the first/last item
   follow_symlinks = false,
   -- Set true to include hidden files/directories for non-git roots. Git roots already include
   -- hidden non-ignored files; existing ignore rules apply and .git internals stay excluded.
@@ -325,8 +358,16 @@ require('fff').setup({
     flex = { size = 130, wrap = 'top' },
     min_list_height = 10, --  do not display anything except the list below this threshold
     show_scrollbar = true,
-    path_shorten_strategy = 'middle_number', -- 'middle_number' | 'middle' | 'end' | 'start'
+    path_shorten_strategy = 'middle', -- 'middle' | 'middle_number' | 'end' | 'start'
+    -- 'center' | 'top' | 'bottom' | 'left' | 'right' | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right'
     anchor = 'center',
+    show_path_first = false, -- true renders results as `path/to/file` instead of `file path/to`
+  },
+  -- find_files specific rendering
+  file_picker = {
+    current_file_label = '(current)', -- virtual text marking the buffer the picker was opened from
+    fuzzy_query_highlighting = false, -- bypassed when ordered_fuzzy_parts is true
+    ordered_fuzzy_parts = false, -- require space-separated query chunks to match in typed order
   },
   preview = {
     enabled = true,
@@ -360,10 +401,17 @@ require('fff').setup({
     grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
     grep_jump_to_prev_file = { '<C-A-p>', '<A-Up>' },
     cycle_previous_query = '<C-Up>',
+    cycle_forward_query = '<C-Down>',
+    -- unbound by default, wipes the whole input line
+    -- clear_query = '<C-u>', -- overrides preview_scroll_up in insert mode
     toggle_select = '<Tab>',
     send_to_quickfix = '<C-q>',
     focus_list = '<leader>l',
     focus_preview = '<leader>p',
+  },
+  -- extra keymaps for the picker input, keyed by mode, applied over the built-ins
+  mappings = {
+    -- i = { ['<A-BS>'] = function() vim.api.nvim_input('<C-w>') end },
   },
   frecency = {
     enabled = true,
@@ -377,13 +425,6 @@ require('fff').setup({
   },
   git = {
     status_text_color = false, -- true to color filenames by git status
-  },
-  file_picker = {
-    -- Highlights fuzzy ranges; intentionally bypassed with ordered_fuzzy_parts for legacy picker rendering.
-    fuzzy_query_highlighting = false,
-    -- In ordered mode, space-separated query chunks (for example, "foo bar") are
-    -- strict in-order subsequences; chunk typos are not corrected.
-    ordered_fuzzy_parts = false,
   },
   select = {
     -- Return winid to open the chosen file in, or nil to open in the original window
@@ -416,6 +457,7 @@ require('fff').setup({
     },
   },
   logging = {
+    enabled = true,
     -- logs will be written in a parent directory of this file path in files like
     -- `<stem>+<UTC-timestamp>+<pid>.<ext>`. Run :FFFOpenLog to open current one
     log_file = vim.fn.stdpath('log') .. '/fff.log',
@@ -575,7 +617,7 @@ const rustFiles = finder.value.glob("**/*.rs", { pageSize: 100 });
 finder.value.destroy();
 ```
 
-Every method returns a `Result<T>` (`{ ok: true, value } | { ok: false, error }`). Full type reference: [`packages/fff-node/src/types.ts`](./packages/fff-node/src/types.ts).
+Every method returns a `Result<T>` (`{ ok: true, value } | { ok: false, error }`). Full type reference: [`packages/fff-node/src/fff-api.ts`](./packages/fff-node/src/fff-api.ts).
 
 </details>
 
