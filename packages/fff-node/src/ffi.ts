@@ -52,6 +52,7 @@ import {
 } from "ffi-rs";
 import { findBinary } from "./binary.js";
 import type {
+  DefinitionMode,
   DirItem,
   DirSearchResult,
   FileItem,
@@ -66,7 +67,7 @@ import type {
   WatchEvent,
   WatchEventKind,
 } from "./fff-api.js";
-import { createGrepCursor, err } from "./fff-api.js";
+import { createGrepCursor, definitionModeToInt, err } from "./fff-api.js";
 
 const LIBRARY_KEY = "fff_c";
 
@@ -474,6 +475,7 @@ const FFF_SCORE_STRUCT = {
   distance_penalty: DataType.I32,
   current_file_penalty: DataType.I32,
   combo_match_boost: DataType.I32,
+  path_alignment_bonus: DataType.I32,
   exact_match: DataType.U8,
   match_type: DataType.External,
 };
@@ -487,6 +489,7 @@ interface FffScoreRaw {
   distance_penalty: number;
   current_file_penalty: number;
   combo_match_boost: number;
+  path_alignment_bonus: number;
   exact_match: number;
   match_type: JsExternal;
 }
@@ -623,7 +626,7 @@ const FFF_GREP_MATCH_STRUCT = {
   match_ranges_count: DataType.U32,
   context_before_count: DataType.U32,
   context_after_count: DataType.U32,
-  fuzzy_score: DataType.U32, // actually u16 in C, but ffi-rs doesn't so we read it as u32 with padding
+  fuzzy_score: DataType.I16, // u16 in C; ffi-rs has no U16, so read I16 and mask (#888)
   has_fuzzy_score: DataType.U8,
   is_binary: DataType.U8,
   is_definition: DataType.U8,
@@ -713,6 +716,7 @@ function readScoreFromRaw(raw: FffScoreRaw): Score {
     distancePenalty: raw.distance_penalty,
     currentFilePenalty: raw.current_file_penalty,
     comboMatchBoost: raw.combo_match_boost,
+    pathAlignmentBonus: raw.path_alignment_bonus,
     exactMatch: raw.exact_match !== 0,
     matchType: readCString(raw.match_type) ?? "",
   };
@@ -841,7 +845,7 @@ function readGrepMatchFromRaw(raw: FffGrepMatchRaw): GrepMatch {
   };
 
   if (raw.has_fuzzy_score !== 0) {
-    match.fuzzyScore = raw.fuzzy_score;
+    match.fuzzyScore = raw.fuzzy_score & 0xffff;
   }
   if (raw.context_before_count > 0) {
     match.contextBefore = readCStringArray(raw.context_before, raw.context_before_count);
@@ -1365,15 +1369,19 @@ export function ffiLiveGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   loadLibrary();
 
   const rawPtr = load({
     library: LIBRARY_KEY,
-    funcName: "fff_live_grep",
+    funcName: "fff_live_grep_ex",
     retType: DataType.External,
     paramsType: [
       DataType.External, // handle
@@ -1385,9 +1393,10 @@ export function ffiLiveGrep(
       DataType.U32, // file_offset
       DataType.U32, // page_limit
       DataType.U64, // time_budget_ms
+      DataType.Boolean, // enforce_time_budget
       DataType.U32, // before_context
       DataType.U32, // after_context
-      DataType.Boolean, // classify_definitions
+      DataType.U8, // classify_definitions
     ],
     paramsValue: [
       handle,
@@ -1399,9 +1408,10 @@ export function ffiLiveGrep(
       fileOffset,
       pageLimit,
       timeBudgetMs,
+      enforceTimeBudget,
       beforeContext,
       afterContext,
-      classifyDefinitions,
+      definitionMode,
     ],
     freeResultMemory: false,
   }) as JsExternal;
@@ -1422,15 +1432,19 @@ export function ffiMultiGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   loadLibrary();
 
   const rawPtr = load({
     library: LIBRARY_KEY,
-    funcName: "fff_multi_grep",
+    funcName: "fff_multi_grep_ex",
     retType: DataType.External,
     paramsType: [
       DataType.External, // handle
@@ -1442,9 +1456,10 @@ export function ffiMultiGrep(
       DataType.U32, // file_offset
       DataType.U32, // page_limit
       DataType.U64, // time_budget_ms
+      DataType.Boolean, // enforce_time_budget
       DataType.U32, // before_context
       DataType.U32, // after_context
-      DataType.Boolean, // classify_definitions
+      DataType.U8, // classify_definitions
     ],
     paramsValue: [
       handle,
@@ -1456,9 +1471,10 @@ export function ffiMultiGrep(
       fileOffset,
       pageLimit,
       timeBudgetMs,
+      enforceTimeBudget,
       beforeContext,
       afterContext,
-      classifyDefinitions,
+      definitionMode,
     ],
     freeResultMemory: false,
   }) as JsExternal;
@@ -1616,8 +1632,9 @@ export function ffiGetHistoricalQuery(
 // is only supported as a top-level parameter.
 //
 // Batch contents are read through the C accessors (fff_watch_events_count /
-// fff_watch_events_get_path / fff_watch_events_get_kind), so no struct
-// layout knowledge lives on this side.
+// fff_watch_events_get_path / fff_watch_events_get_kind /
+// fff_watch_events_get_from_path), so no struct layout knowledge lives on
+// this side.
 
 /** Map the C kind byte to the public WatchEventKind. */
 function watchKindFromU8(kind: number): WatchEventKind {
@@ -1628,6 +1645,8 @@ function watchKindFromU8(kind: number): WatchEventKind {
       return "modified";
     case 2:
       return "removed";
+    case 4:
+      return "renamed";
     default:
       return "rescan";
   }
@@ -1685,10 +1704,22 @@ function consumeWatchBatch(address: number): WatchEvent[] {
       paramsType: [DataType.External, DataType.U32],
       paramsValue: [batchPtr, i],
     }) as unknown as number;
-    events.push({
+    const event: WatchEvent = {
       path: readCString(path) ?? "",
       kind: watchKindFromU8(kind),
-    });
+    };
+    if (event.kind === "renamed") {
+      const from = load({
+        library: LIBRARY_KEY,
+        funcName: "fff_watch_events_get_from_path",
+        retType: DataType.External,
+        paramsType: [DataType.External, DataType.U32],
+        paramsValue: [batchPtr, i],
+      }) as unknown as JsExternal;
+      const decoded = readCString(from);
+      if (decoded) event.from = decoded;
+    }
+    events.push(event);
   }
 
   load({

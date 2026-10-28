@@ -20,6 +20,7 @@ import {
 import { findBinary } from "./download";
 import { embeddedLibPath } from "./embedded";
 import type {
+  DefinitionMode,
   DirItem,
   DirSearchResult,
   FileItem,
@@ -35,7 +36,7 @@ import type {
   WatchEvent,
   WatchEventKind,
 } from "./fff-api";
-import { createGrepCursor, err } from "./fff-api";
+import { createGrepCursor, definitionModeToInt, err } from "./fff-api";
 
 /** Grep mode constants matching the C API (u8). */
 const GREP_MODE_PLAIN = 0;
@@ -139,7 +140,7 @@ const ffiDefinition = {
   },
 
   // Live grep (content search)
-  fff_live_grep: {
+  fff_live_grep_ex: {
     args: [
       FFIType.ptr, // handle
       FFIType.cstring, // query
@@ -150,15 +151,16 @@ const ffiDefinition = {
       FFIType.u32, // file_offset
       FFIType.u32, // page_limit
       FFIType.u64, // time_budget_ms
+      FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
-      FFIType.bool, // classify_definitions
+      FFIType.u8, // classify_definitions
     ],
     returns: FFIType.ptr,
   },
 
   // Multi-pattern grep (Aho-Corasick)
-  fff_multi_grep: {
+  fff_multi_grep_ex: {
     args: [
       FFIType.ptr, // handle
       FFIType.cstring, // patterns_joined (\n-separated)
@@ -169,9 +171,10 @@ const ffiDefinition = {
       FFIType.u32, // file_offset
       FFIType.u32, // page_limit
       FFIType.u64, // time_budget_ms
+      FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
-      FFIType.bool, // classify_definitions
+      FFIType.u8, // classify_definitions
     ],
     returns: FFIType.ptr,
   },
@@ -238,6 +241,10 @@ const ffiDefinition = {
   fff_watch_events_get_kind: {
     args: [FFIType.ptr, FFIType.u32],
     returns: FFIType.u8,
+  },
+  fff_watch_events_get_from_path: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
   },
 
   // Git
@@ -655,7 +662,8 @@ const SC_FREC = 16; // i32         (4)
 const SC_DIST = 20; // i32         (4)
 const SC_CURFILE = 24; // i32         (4)
 const SC_COMBO = 28; // i32         (4)
-const SC_EXACT = 32; // bool        (1 + 7 pad)
+const SC_PATH_ALIGN = 32; // i32         (4)
+const SC_EXACT = 36; // bool        (1 + 3 pad)
 const SC_MTYPE = 40; // *mut c_char (8)
 const SC_SIZE_OF = 48;
 
@@ -695,6 +703,7 @@ function readScoreStruct(p: number): Score {
     distancePenalty: read.i32(pp, SC_DIST),
     currentFilePenalty: read.i32(pp, SC_CURFILE),
     comboMatchBoost: read.i32(pp, SC_COMBO),
+    pathAlignmentBonus: read.i32(pp, SC_PATH_ALIGN),
     exactMatch: read.u8(pp, SC_EXACT) !== 0,
     matchType: readCString(read.ptr(pp, SC_MTYPE)) ?? "",
   };
@@ -1244,12 +1253,16 @@ export function ffiLiveGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_live_grep(
+  const resultPtr = library.symbols.fff_live_grep_ex(
     handle,
     ptr(encodeString(query)),
     grepModeToU8(mode),
@@ -1259,9 +1272,10 @@ export function ffiLiveGrep(
     fileOffset,
     pageLimit,
     BigInt(timeBudgetMs),
+    enforceTimeBudget,
     beforeContext,
     afterContext,
-    classifyDefinitions,
+    definitionMode,
   );
   return parseGrepResult(resultPtr);
 }
@@ -1279,12 +1293,16 @@ export function ffiMultiGrep(
   fileOffset: number,
   pageLimit: number,
   timeBudgetMs: number,
+  enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_multi_grep(
+  const resultPtr = library.symbols.fff_multi_grep_ex(
     handle,
     ptr(encodeString(patternsJoined)),
     ptr(encodeString(constraints)),
@@ -1294,9 +1312,10 @@ export function ffiMultiGrep(
     fileOffset,
     pageLimit,
     BigInt(timeBudgetMs),
+    enforceTimeBudget,
     beforeContext,
     afterContext,
-    classifyDefinitions,
+    definitionMode,
   );
   return parseGrepResult(resultPtr);
 }
@@ -1392,6 +1411,7 @@ const WATCH_EVENT_KINDS: readonly WatchEventKind[] = [
   "modified",
   "removed",
   "rescan",
+  "renamed",
 ];
 
 /**
@@ -1412,10 +1432,16 @@ export function readWatchEventBatch(batchPtr: Pointer | number | null): WatchEve
   for (let i = 0; i < count; i++) {
     const path = symbols.fff_watch_events_get_path(bp, i) as Pointer | null;
     const kind = symbols.fff_watch_events_get_kind(bp, i) as number;
-    events.push({
+    const event: WatchEvent = {
       path: readCString(path) ?? "",
       kind: WATCH_EVENT_KINDS[kind] ?? "rescan",
-    });
+    };
+    if (event.kind === "renamed") {
+      const from = symbols.fff_watch_events_get_from_path(bp, i) as Pointer | null;
+      const decoded = readCString(from);
+      if (decoded) event.from = decoded;
+    }
+    events.push(event);
   }
 
   symbols.fff_free_watch_events(bp);

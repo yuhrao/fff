@@ -1,20 +1,18 @@
+use crate::match_offsets::char_indices_to_byte_offsets;
 use crate::simd_path::ArenaPtr;
 use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::lines::LineStep;
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::sink::{
-    char_indices_to_byte_offsets, classify_definition, strip_line_terminators,
-    truncate_display_bytes,
-};
+use super::sink::{strip_line_terminators, truncate_display_bytes};
 use super::types::{GrepMatch, GrepResult, GrepSearchOptions};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fuzzy_grep_search<'a>(
     grep_text: &str,
-    files_to_search: &[&'a FileItem],
+    files_to_search: &mut super::prefilter::RankedFiles<'a>,
     options: &GrepSearchOptions,
     total_files: usize,
     filtered_file_count: usize,
@@ -25,6 +23,10 @@ pub(super) fn fuzzy_grep_search<'a>(
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> GrepResult<'a> {
+    #[cfg(unix)]
+    let base_dir = std::fs::File::open(base_path).ok();
+    #[cfg(not(unix))]
+    let base_dir = None;
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" -> "schema") costs ~1 typo with
     // default gap penalties. We scale max_typos by needle length:
@@ -53,7 +55,7 @@ pub(super) fn fuzzy_grep_search<'a>(
         &neo_frizbee::Config {
             // Use the real max_typos so frizbee's SIMD prefilter actually rejects non-matching lines (~2 SIMD instructions per line vs full SW scoring).
             max_typos: Some(max_typos as u16),
-            sort: false,
+            sort: neo_frizbee::SortStrategy::Unsorted,
             scoring,
             ..Default::default()
         },
@@ -107,7 +109,8 @@ pub(super) fn fuzzy_grep_search<'a>(
         None
     };
     let search_start = std::time::Instant::now();
-    let budget_exceeded = AtomicBool::new(false);
+    // Lowest index an abort skipped, i.e. the resume point; usize::MAX means no abort.
+    let first_skipped = AtomicUsize::new(usize::MAX);
     let max_matches_per_file = options.max_matches_per_file;
 
     // for fuzzy match we need a bit smarter chunking as the amount of work we have to perform is
@@ -133,7 +136,7 @@ pub(super) fn fuzzy_grep_search<'a>(
 
     while chunk_start < files_to_search.len() {
         let chunk_end = (chunk_start + chunk_size).min(files_to_search.len());
-        let chunk = &files_to_search[chunk_start..chunk_end];
+        let chunk = files_to_search.batch(chunk_start..chunk_end);
         let chunk_offset = chunk_start;
         chunk_start = chunk_end;
         chunk_size = (chunk_size * growth).min(max_chunk);
@@ -153,15 +156,14 @@ pub(super) fn fuzzy_grep_search<'a>(
                     )
                 },
                 |(matcher, buf, mmap_slot), (local_idx, file)| {
-                    if abort_signal.load(Ordering::Relaxed) {
-                        budget_exceeded.store(true, Ordering::Relaxed);
-                        return None;
-                    }
-
-                    if let Some(budget) = time_budget
-                        && search_start.elapsed() > budget
+                    // File 0 is never skipped so a page always consumes at least one
+                    // file (cursor 0 means "done").
+                    let idx = chunk_offset + local_idx;
+                    if idx > 0
+                        && (abort_signal.load(Ordering::Relaxed)
+                            || time_budget.is_some_and(|b| search_start.elapsed() > b))
                     {
-                        budget_exceeded.store(true, Ordering::Relaxed);
+                        first_skipped.fetch_min(idx, Ordering::Relaxed);
                         return None;
                     }
 
@@ -171,8 +173,14 @@ pub(super) fn fuzzy_grep_search<'a>(
                         arena
                     };
 
-                    let file_bytes =
-                        file.get_content_for_search(buf, mmap_slot, file_arena, base_path, budget)?;
+                    let file_bytes = file.get_content_for_search(
+                        buf,
+                        mmap_slot,
+                        file_arena,
+                        base_path,
+                        budget,
+                        base_dir.as_ref(),
+                    )?;
 
                     if min_chars_required > 0 {
                         let mut chars_found = 0usize;
@@ -271,7 +279,7 @@ pub(super) fn fuzzy_grep_search<'a>(
 
                         if let (Some(&first), Some(&last)) = (indices.first(), indices.last()) {
                             // reject widely scattered matches
-                            let span = last - first + 1;
+                            let span = (last - first + 1) as usize;
                             if span > max_match_span {
                                 continue;
                             }
@@ -301,6 +309,14 @@ pub(super) fn fuzzy_grep_search<'a>(
                         let (ln, bo) = line_meta[idx];
                         let match_byte_offsets =
                             char_indices_to_byte_offsets(display_line, &match_indices.indices);
+                        let Some(is_definition) = options.classify_definitions.classify_match(
+                            file,
+                            raw_line.as_bytes(),
+                            &match_byte_offsets,
+                            true,
+                        ) else {
+                            continue;
+                        };
                         let col = match_byte_offsets
                             .first()
                             .map(|r| r.0 as usize)
@@ -311,10 +327,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                             line_number: ln,
                             col,
                             byte_offset: bo,
-                            is_definition: classify_definition(
-                                options.classify_definitions,
-                                display_line,
-                            ),
+                            is_definition,
                             line_content: display_line.to_string(),
                             match_byte_offsets,
                             fuzzy_score: Some(match_indices.score),
@@ -331,7 +344,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                         return None;
                     }
 
-                    Some((chunk_offset + local_idx, *file, file_matches))
+                    Some((idx, *file, file_matches))
                 },
             )
             .flatten()
@@ -342,17 +355,18 @@ pub(super) fn fuzzy_grep_search<'a>(
             per_file_results.push(result);
         }
 
-        if running_matches >= page_limit || budget_exceeded.load(Ordering::Relaxed) {
+        if running_matches >= page_limit || first_skipped.load(Ordering::Relaxed) != usize::MAX {
             break;
         }
     }
 
+    let abort_resume = Some(first_skipped.load(Ordering::Relaxed)).filter(|&i| i != usize::MAX);
     GrepResult::collect(
         per_file_results,
         files_to_search.len(),
         options,
         total_files,
         filtered_file_count,
-        budget_exceeded.load(Ordering::Relaxed),
+        abort_resume,
     )
 }

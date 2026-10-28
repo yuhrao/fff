@@ -5,6 +5,26 @@ use std::sync::atomic::AtomicBool;
 
 pub use crate::constants::MAX_FFFILE_SIZE;
 
+/// Controls case sensitivity of the grep pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Casing {
+    /// Case-insensitive unless the pattern contains an uppercase char.
+    #[default]
+    Smart,
+    Sensitive,
+    Insensitive,
+}
+
+impl Casing {
+    pub fn is_insensitive_for(self, pattern: &str) -> bool {
+        match self {
+            Casing::Smart => !pattern.chars().any(|c| c.is_uppercase()),
+            Casing::Insensitive => true,
+            Casing::Sensitive => false,
+        }
+    }
+}
+
 /// Controls how the grep pattern is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrepMode {
@@ -82,7 +102,11 @@ impl GrepMatch {
 pub struct GrepSearchOptions {
     pub max_file_size: u64,
     pub max_matches_per_file: usize,
+    /// Legacy toggle: `true` => `Casing::Smart`, `false` => `Casing::Sensitive`.
+    /// Ignored when `casing` is `Some`.
     pub smart_case: bool,
+    /// Explicit case mode; overrides `smart_case` when set.
+    pub casing: Option<Casing>,
     /// File-based pagination offset: index into the sorted/filtered file list
     /// to start searching from. Pass 0 for the first page, then use
     /// `GrepResult::next_file_offset` for subsequent pages.
@@ -94,13 +118,16 @@ pub struct GrepSearchOptions {
     /// Maximum time in milliseconds to spend searching before returning partial
     /// results. Prevents UI freezes on pathological queries. 0 = no limit.
     pub time_budget_ms: u64,
+    /// Apply `time_budget_ms` even before anything matched. Off by default: plain/regex
+    /// grep only starts counting once matches exist, so a zero-match query scans everything.
+    pub enforce_time_budget: bool,
     /// Number of context lines to include before each match. 0 = disabled.
     pub before_context: usize,
     /// Number of context lines to include after each match. 0 = disabled.
     pub after_context: usize,
-    /// Whether to classify each match as a definition line. Adds ~2% overhead
-    /// on large repos; disable for interactive grep where it is not needed.
-    pub classify_definitions: bool,
+    /// Classify all matches or return only definitions/usages for this query.
+    /// Defaults to Off.
+    pub classify_definitions: super::DefinitionMode,
     /// Strip leading whitespace from matched lines and context lines, adjusting
     /// highlight byte offsets accordingly. Useful for AI/MCP consumers and UIs
     /// that don't need indentation. Default: false.
@@ -112,19 +139,31 @@ pub struct GrepSearchOptions {
     pub abort_signal: Option<Arc<AtomicBool>>,
 }
 
+impl GrepSearchOptions {
+    pub fn effective_casing(&self) -> Casing {
+        match self.casing {
+            Some(mode) => mode,
+            None if self.smart_case => Casing::Smart,
+            None => Casing::Sensitive,
+        }
+    }
+}
+
 impl Default for GrepSearchOptions {
     fn default() -> Self {
         Self {
             max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 200,
             smart_case: true,
+            casing: None,
             file_offset: 0,
             page_limit: 50,
             mode: GrepMode::default(),
             time_budget_ms: 0,
+            enforce_time_budget: false,
             before_context: 0,
             after_context: 0,
-            classify_definitions: false,
+            classify_definitions: Default::default(),
             trim_whitespace: false,
             abort_signal: None,
         }
@@ -173,7 +212,8 @@ impl<'a> GrepResult<'a> {
         options: &GrepSearchOptions,
         total_files: usize,
         filtered_file_count: usize,
-        budget_exceeded: bool,
+        // Lowest unsearched index when an abort stopped the search.
+        abort_resume: Option<usize>,
     ) -> Self {
         let page_limit = options.page_limit;
 
@@ -189,8 +229,14 @@ impl<'a> GrepResult<'a> {
         // files between them that had no matches were still searched and can be
         // safely skipped on the next page
         let mut files_consumed: usize = 0;
+        let mut page_filled = false;
 
         for (batch_idx, file, file_matches) in per_file_results {
+            // Matches past the abort point are dropped; the next page re-searches them.
+            if abort_resume.is_some_and(|at| batch_idx >= at) {
+                continue;
+            }
+
             // batch_idx is the 0-based position in files_to_search.
             // Advance files_consumed to include this file and all no-match files before it.
             files_consumed = batch_idx + 1;
@@ -210,17 +256,20 @@ impl<'a> GrepResult<'a> {
             // stopping, so no matches are dropped. A page may return up to
             // page_limit + max_matches_per_file - 1 matches in the worst case
             if all_matches.len() >= page_limit {
+                page_filled = true;
                 break;
             }
         }
 
-        // If no file had any match, we searched the entire slice.
-        if result_files.is_empty() {
-            files_consumed = files_to_search_len;
+        // A full page resumes after its last returned file, even if later workers aborted.
+        match abort_resume {
+            Some(resume_at) if !page_filled => files_consumed = resume_at.min(files_to_search_len),
+            None if result_files.is_empty() => files_consumed = files_to_search_len,
+            _ => {}
         }
 
-        let has_more = budget_exceeded
-            || (all_matches.len() >= page_limit && files_consumed < files_to_search_len);
+        let has_more = files_consumed < files_to_search_len
+            && (abort_resume.is_some() || all_matches.len() >= page_limit);
 
         let next_file_offset = if has_more {
             options.file_offset + files_consumed

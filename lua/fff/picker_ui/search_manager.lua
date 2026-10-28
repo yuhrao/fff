@@ -54,7 +54,9 @@ local function search_buffers(query, offset, limit)
     local hits = vim.fn.matchfuzzypos(paths, query)
     local matched_paths = hits and hits[1] or {}
     local by_path = {}
-    for _, it in ipairs(items) do by_path[it.relative_path] = it end
+    for _, it in ipairs(items) do
+      by_path[it.relative_path] = it
+    end
     matched = {}
     for _, p in ipairs(matched_paths) do
       if by_path[p] then table.insert(matched, by_path[p]) end
@@ -111,7 +113,7 @@ function M.update_results_sync()
       S.pagination.grep_file_offsets = { 0 }
       S.pagination.grep_next_file_offset = grep_result.next_file_offset or 0
       S.grep_regex_fallback_error = grep_result.regex_fallback_error or nil
-      if grep_result.next_file_offset and grep_result.next_file_offset > 0 then
+      if grep_result.next_file_offset and grep_result.next_file_offset ~= 0 then
         S.pagination.grep_file_offsets[2] = grep_result.next_file_offset
       end
     end
@@ -138,7 +140,17 @@ function M.update_results_sync()
 
   S.suggestion_items = nil
   S.suggestion_source = nil
-  if #results == 0 and S.query ~= '' and S.mode ~= 'buffers' then
+  local suggestions_enabled = (S.config.suggestions or {}).enabled ~= false
+  if
+    S.mode == 'grep'
+    and (
+      S.grep_mode == 'definition_only'
+      or (S.grep_config and S.grep_config.classify_definitions == 'definition_only')
+    )
+  then
+    suggestions_enabled = false
+  end
+  if #results == 0 and S.query ~= '' and suggestions_enabled and S.mode ~= 'buffers' then
     if S.mode == 'grep' then
       local suggestion_results =
         file_picker.search_files_paginated(S.query, S.current_file_cache, S.config.max_threads, nil, 0, page_size)
@@ -147,8 +159,7 @@ function M.update_results_sync()
         S.suggestion_source = 'files'
       end
     else
-      local grep_result = grep.search(S.query, 0, page_size, S.grep_config, 'plain')
-      local grep_items = grep_result and grep_result.items or {}
+      local grep_items = M.suggestion_grep(page_size)
       if #grep_items > 0 then
         S.suggestion_items = grep_items
         S.suggestion_source = 'grep'
@@ -168,6 +179,36 @@ function M.update_results_sync()
   end
 
   P.render_debounced()
+end
+
+-- Hint only: hard time budget (a zero-hit query would otherwise scan every file)
+-- and skipped unless the bigram index is built, since without it grep is a cold disk scan.
+---@param page_size number
+---@return table[]
+function M.suggestion_grep(page_size)
+  if not file_picker.get_scan_progress().is_index_ready then return {} end
+  local suggest_config = S.config.suggestions or {}
+
+  local grep_config = vim.tbl_extend('force', S.grep_config or S.config.grep or {}, {
+    enforce_time_budget = true,
+    time_budget_ms = suggest_config.grep_time_budget_ms or 50,
+  })
+  local ok, grep_result = pcall(
+    require('fff.fuzzy').live_grep,
+    S.query,
+    0,
+    page_size,
+    grep_config.max_file_size,
+    grep_config.max_matches_per_file,
+    grep_config.smart_case,
+    'plain',
+    grep_config.time_budget_ms,
+    grep_config.trim_whitespace,
+    true,
+    grep_config.casing
+  )
+  if not ok or not grep_result then return {} end
+  return grep_result.items or {}
 end
 
 function M.load_page_at_index(new_page_index, adjust_cursor_fn)
@@ -195,12 +236,12 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
       S.pagination.grep_next_file_offset = grep_result.next_file_offset or 0
       S.grep_regex_fallback_error = grep_result.regex_fallback_error or nil
 
-      if grep_result.next_file_offset and grep_result.next_file_offset > 0 then
+      if grep_result.next_file_offset and grep_result.next_file_offset ~= 0 then
         S.pagination.grep_file_offsets[new_page_index + 2] = grep_result.next_file_offset
       end
     end
   elseif S.mode == 'buffers' then
-    results, S.pagination.total_matched = search_buffers(S.query, new_page_index * page_size, page_size)
+    ok, results, S.pagination.total_matched = pcall(search_buffers, S.query, new_page_index * page_size, page_size)
   else
     ok, results = pcall(
       file_picker.search_files_paginated,
@@ -218,7 +259,9 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
     return false
   end
 
-  if #results == 0 then return false end
+  if #results == 0 and (S.mode ~= 'grep' or (S.pagination.grep_next_file_offset == 0 and #S.filtered_items > 0)) then
+    return false
+  end
 
   if S.mode ~= 'grep' and S.mode ~= 'buffers' then
     local metadata = file_picker.get_search_metadata()
@@ -229,7 +272,9 @@ function M.load_page_at_index(new_page_index, adjust_cursor_fn)
   S.filtered_items = results
   S.pagination.page_index = new_page_index
 
-  if adjust_cursor_fn then
+  if #results == 0 then
+    S.cursor = 1
+  elseif adjust_cursor_fn then
     local cursor_ok, cursor_err = pcall(adjust_cursor_fn, #results)
     if not cursor_ok then
       vim.notify('Error in cursor adjustment: ' .. tostring(cursor_err), vim.log.levels.ERROR)
@@ -321,7 +366,9 @@ function M.cycle_grep_modes()
   if not P.state.active or S.mode ~= 'grep' then return end
 
   ---@diagnostic disable-next-line: undefined-field
-  local modes = (S.grep_config and S.grep_config.modes) or S.config.grep.modes or { 'plain', 'regex', 'fuzzy' }
+  local modes = (S.grep_config and S.grep_config.modes)
+    or S.config.grep.modes
+    or { 'plain', 'regex', 'fuzzy', 'definition_only' }
 
   if #modes <= 1 then return end
 

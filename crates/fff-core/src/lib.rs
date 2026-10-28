@@ -119,6 +119,11 @@ pub use dbs::*;
 /// Git status caching and repository detection utilities.
 pub mod git;
 
+pub mod git_recency;
+pub use git_recency::GitRecencyConfig;
+
+mod definition;
+
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
 pub mod grep;
 pub use grep::*;
@@ -132,6 +137,8 @@ pub mod path_utils;
 /// Core data types shared across the crate.
 pub mod types;
 pub use types::*;
+
+mod match_offsets;
 
 pub mod constants;
 
