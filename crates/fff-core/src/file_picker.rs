@@ -32,12 +32,15 @@ use crate::FFFStringStorage;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::{FrecencyReader, FrecencyTracker};
-use crate::git::{GitDiscovery, GitStatusCache};
-use crate::git_recency::{self, GitRecencyConfig};
+use crate::git::Status;
+use crate::git_recency::GitRecencyConfig;
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
+use crate::scm::ScmWorkspace;
+use crate::scm::{ScmBackend, ScmStatusWorker};
+use crate::scm::{ScmStatusCache, StatusMap};
 use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
@@ -50,7 +53,6 @@ use crate::walk::WalkOutput;
 use crate::watch::BackgroundWatcher;
 use ahash::AHashMap;
 use fff_query_parser::FFFQuery;
-use git2::{Repository, Status};
 use rayon::prelude::*;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
@@ -59,11 +61,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
 
-use crate::parallelism::{BACKGROUND_THREAD_POOL, SEARCH_THREAD_POOL};
+use crate::parallelism::{SEARCH_THREAD_POOL, indexing_pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FFFMode {
@@ -94,7 +95,7 @@ pub struct FuzzySearchOptions<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileSync {
-    pub(crate) git: Option<GitDiscovery>,
+    pub(crate) git: Option<ScmWorkspace>,
     // Base path re-rooted into the main checkout when indexing a linked git worktree,
     // frecency and query history are keyed by it so all worktrees share one history
     shared_base: Option<PathBuf>,
@@ -127,8 +128,7 @@ pub(crate) struct FileSync {
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
     /// the arena alive while iterating file paths.
     chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
-    /// Ignore rules the walker assembled (zlob backend only). Shared with the
-    /// background watcher so filesystem events can be filtered without libgit2.
+    // The watcher reuses these rules to filter filesystem events.
     pub(crate) ignore_rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
 }
 
@@ -247,10 +247,10 @@ impl FileSync {
         self.find_by_relative_path_with(rel_path, |dir| self.find_base_dir_index(dir))
     }
 
-    fn find_by_relative_path_with(
+    fn find_by_relative_path_with<'a>(
         &self,
-        rel_path: &str,
-        find_dir: impl FnOnce(&str) -> Option<usize>,
+        rel_path: &'a str,
+        find_dir: impl FnOnce(&'a str) -> Option<usize>,
     ) -> Option<usize> {
         let arena = self.arena_base_ptr();
         // Split into directory (with trailing '/') and filename.
@@ -261,27 +261,10 @@ impl FileSync {
         let dir_rel = &rel_path[..parent_end];
         let filename = &rel_path[parent_end..];
 
-        if let Some(dir_idx) = find_dir(dir_rel) {
-            let dir_idx = dir_idx as u32;
-            let cmp_key = |f: &FileItem| {
-                f.parent_dir_index.cmp(&dir_idx).then_with(|| {
-                    let fname = f.file_name(arena);
-                    fname.as_str().cmp(filename)
-                })
-            };
-
-            if self.indexable_count > 0
-                && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(cmp_key)
-            {
-                return Some(pos);
-            }
-
-            if self.indexable_count < self.base_count
-                && let Ok(rel_pos) =
-                    self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
-            {
-                return Some(self.indexable_count + rel_pos);
-            }
+        if let Some(dir_idx) = find_dir(dir_rel)
+            && let Some(pos) = self.find_base_file_index(dir_idx as u32, filename, arena)
+        {
+            return Some(pos);
         }
 
         // Overflow region: linear scan by full relative path.
@@ -296,6 +279,79 @@ impl FileSync {
         }
 
         None
+    }
+
+    fn find_base_file_index(&self, dir_idx: u32, filename: &str, arena: ArenaPtr) -> Option<usize> {
+        let mut fname = String::new();
+        let mut cmp_key = |f: &FileItem| {
+            f.parent_dir_index.cmp(&dir_idx).then_with(|| {
+                fname.clear();
+                f.write_file_name_from_arena(arena, &mut fname);
+                fname.as_str().cmp(filename)
+            })
+        };
+
+        if self.indexable_count > 0
+            && let Ok(pos) = self.files[..self.indexable_count].binary_search_by(&mut cmp_key)
+        {
+            return Some(pos);
+        }
+
+        if self.indexable_count < self.base_count
+            && let Ok(rel_pos) =
+                self.files[self.indexable_count..self.base_count].binary_search_by(cmp_key)
+        {
+            return Some(self.indexable_count + rel_pos);
+        }
+
+        None
+    }
+
+    // Marks base files that `previous` already read as text with the same path, size and mtime,
+    // so a rescan only reads changed files. Binary verdicts are always checked again.
+    fn unchanged_text_files(&self, previous: &FileSync) -> Vec<u64> {
+        if previous.base_count == 0 {
+            return Vec::new();
+        }
+        let mut known_text = vec![0u64; self.base_count.div_ceil(64)];
+
+        let arena = self.arena_base_ptr();
+        let previous_arena = previous.arena_base_ptr();
+        let mut buf = [0u8; PATH_BUF_SIZE];
+        let previous_dirs: Vec<Option<u32>> = self.dirs[..self.base_dirs_count]
+            .iter()
+            .map(|dir| {
+                let dir = dir.read_relative_path(arena, &mut buf);
+                previous.find_base_dir_index(dir).map(|i| i as u32)
+            })
+            .collect();
+
+        let mut name = String::new();
+        for (index, file) in self.files[..self.base_count].iter().enumerate() {
+            let Some(&Some(previous_dir)) = previous_dirs.get(file.parent_dir_index as usize)
+            else {
+                continue;
+            };
+
+            name.clear();
+            file.write_file_name_from_arena(arena, &mut name);
+            let Some(old) = previous
+                .find_base_file_index(previous_dir, &name, previous_arena)
+                .map(|i| &previous.files[i])
+            else {
+                continue;
+            };
+
+            if !old.is_deleted()
+                && !old.is_binary()
+                && old.size == file.size
+                && old.modified == file.modified
+            {
+                known_text[index / 64] |= 1u64 << (index % 64);
+            }
+        }
+
+        known_text
     }
 
     // TODO remove this function and make a better way to remove all files
@@ -622,6 +678,17 @@ impl Default for FilePickerOptions {
     }
 }
 
+/// Controls which ignore rules a picker applies while indexing.
+#[derive(Clone, Debug, Default)]
+pub struct FilePickerIgnoreOptions {
+    /// Extra root-relative rules. Requires the zlob walker.
+    pub extra_ignore: Arc<[String]>,
+    /// Skip Git integration and Git ignore rules.
+    pub disable_git: bool,
+    /// Skip rules from `.ignore` files.
+    pub disable_ignore_files: bool,
+}
+
 pub struct FilePicker {
     pub mode: FFFMode,
     pub base_path: PathBuf,
@@ -631,7 +698,8 @@ pub struct FilePicker {
     /// Single serialized writer for all git-status updates (scan, watcher,
     /// FFI). Owned by the picker so it exists before the first scan; its
     /// consumer thread is spawned lazily once a git workdir is discovered.
-    pub(crate) git_status_worker: Arc<crate::git_status_worker::GitStatusWorker>,
+    pub(crate) scm_backend: ScmBackend,
+    pub(crate) scm_status_worker: Arc<dyn ScmStatusWorker>,
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
     scanned_files_count: Arc<AtomicUsize>,
@@ -639,6 +707,7 @@ pub struct FilePicker {
     enable_content_indexing: bool,
     watch: bool,
     follow_symlinks: bool,
+    ignore_options: FilePickerIgnoreOptions,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     show_hidden: bool,
@@ -718,6 +787,11 @@ impl FilePicker {
         self.follow_symlinks
     }
 
+    /// Returns the ignore options for this picker.
+    pub fn ignore_options(&self) -> &FilePickerIgnoreOptions {
+        &self.ignore_options
+    }
+
     pub fn fs_root_scanning_enabled(&self) -> bool {
         self.enable_fs_root_scanning
     }
@@ -762,6 +836,10 @@ impl FilePicker {
         self.sync_data.get_file_mut(index)
     }
 
+    pub(crate) fn scm_workspace(&self) -> Option<&ScmWorkspace> {
+        self.sync_data.git.as_ref()
+    }
+
     /// Absolute path to the repository root if the indexed tree lives
     /// inside a git working directory. `None` for non-git bases.
     pub fn git_root(&self) -> Option<&Path> {
@@ -780,7 +858,7 @@ impl FilePicker {
     /// Main checkout twin of `path` when the picker indexes a linked git worktree.
     pub fn shared_path_for(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
         let shared_base = self.sync_data.shared_base.as_deref()?;
-        crate::git::shared_twin(path.as_ref(), &self.base_path, shared_base)
+        crate::scm::shared_twin(path.as_ref(), &self.base_path, shared_base)
     }
 
     pub(crate) fn worktree_shared_base(&self) -> Option<&Path> {
@@ -932,8 +1010,14 @@ impl FilePicker {
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
     pub fn new(options: FilePickerOptions) -> Result<Self, Error> {
-        crate::git::tune_libgit2_for_local_reads();
+        Self::with_scm_pause(options, FilePickerIgnoreOptions::default(), Arc::default())
+    }
 
+    fn with_scm_pause(
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+        paused: Arc<AtomicBool>,
+    ) -> Result<Self, Error> {
         let path = PathBuf::from(&options.base_path);
         if !path.exists() {
             error!("Base path does not exist: {}", options.base_path);
@@ -972,9 +1056,11 @@ impl FilePicker {
         let trace_id = crate::log::generate_trace_id();
         let trace_span = crate::log::trace_span(&trace_id, "picker");
 
+        let scm_backend = crate::scm::ScmBackend::configured();
         Ok(FilePicker {
+            scm_backend,
             background_watcher: None,
-            git_status_worker: crate::git_status_worker::GitStatusWorker::new(),
+            scm_status_worker: scm_backend.create_worker(paused),
             base_path: path,
             cache_budget: Arc::new(initial_budget),
             has_explicit_cache_budget: has_explicit_budget,
@@ -986,6 +1072,7 @@ impl FilePicker {
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
             follow_symlinks: options.follow_symlinks,
+            ignore_options,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
             show_hidden: options.show_hidden,
@@ -995,17 +1082,52 @@ impl FilePicker {
         })
     }
 
-    /// Create a picker, place it into the shared handle, and spawn background
-    /// indexing + file-system watcgenerate_trace_id the default entry point.
+    /// Create a shared picker and start background indexing and watching.
     pub fn new_with_shared_state(
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        let mut picker = Self::new(options)?;
-        picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
+        Self::new_with_shared_state_and_ignore_options(
+            shared_picker,
+            shared_frecency,
+            options,
+            FilePickerIgnoreOptions::default(),
+        )
+    }
+
+    /// Starts background indexing with the supplied ignore options.
+    pub fn new_with_shared_state_and_ignore_options(
+        shared_picker: SharedFilePicker,
+        shared_frecency: SharedFrecency,
+        options: FilePickerOptions,
+        ignore_options: FilePickerIgnoreOptions,
+    ) -> Result<(), Error> {
+        let extra_ignore = &ignore_options.extra_ignore;
+        if !cfg!(feature = "zlob") && !extra_ignore.is_empty() {
+            return Err(Error::WalkFailed(
+                "extra ignore rules require the zlob walker".into(),
+            ));
+        }
+        if !cfg!(feature = "zlob")
+            && (ignore_options.disable_git || ignore_options.disable_ignore_files)
+        {
+            return Err(Error::WalkFailed(
+                "disabling Git or .ignore files requires the zlob walker".into(),
+            ));
+        }
+        if extra_ignore.iter().any(|rule| rule.contains('\0')) {
+            return Err(Error::WalkFailed(
+                "extra ignore rules cannot contain NUL bytes".into(),
+            ));
+        }
+
+        let picker = Self::with_scm_pause(
+            options,
+            ignore_options.clone(),
             shared_picker.git_status_pause_flag(),
-        );
+        )?;
+        let backend = picker.scm_backend;
 
         info!(
             "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
@@ -1049,6 +1171,7 @@ impl FilePicker {
         }
 
         ScanJob::new_initial(
+            backend,
             shared_picker,
             shared_frecency,
             path,
@@ -1063,6 +1186,7 @@ impl FilePicker {
                 auto_cache_budget: true,
                 install_watcher: true,
                 follow_symlinks,
+                ignore_options,
                 enable_fs_root_scanning,
                 enable_home_dir_scanning,
                 show_hidden,
@@ -1085,10 +1209,14 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git = FileSync::discover_git(&self.base_path);
+        let git = FileSync::discover_scm(
+            self.scm_backend,
+            &self.base_path,
+            self.ignore_options.disable_git,
+        );
         let git_handle = git
             .as_ref()
-            .map(|git| FileSync::spawn_git_status(git.workdir.clone()));
+            .map(|git| git.backend.spawn_initial_status(git.clone()));
 
         let empty_frecency = SharedFrecency::default();
         let sync = FileSync::walk_filesystem(
@@ -1099,6 +1227,7 @@ impl FilePicker {
             self.mode,
             self.follow_symlinks,
             self.show_hidden,
+            &self.ignore_options,
         )?;
 
         self.sync_data = sync;
@@ -1113,24 +1242,16 @@ impl FilePicker {
         if let Some(handle) = git_handle
             && let Ok(Some(git_cache)) = handle.join()
         {
-            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-
-            let arena = self.arena_base_ptr();
-            for file in self.sync_data.files.iter_mut() {
-                file.git_status = git_cache.lookup_status(file.write_absolute_path(
-                    arena,
-                    &self.base_path,
-                    &mut path_buf,
-                ));
-            }
+            self.update_git_statuses(git_cache, &empty_frecency)?;
         }
 
-        if let Some(workdir) = self.git_root().map(Path::to_path_buf)
-            && let Ok(repo) = Repository::open(&workdir)
-                .inspect_err(|e| debug!(?e, ?workdir, "git recency: failed to open repo"))
+        if let Some(workspace) = self.scm_workspace()
+            && let Ok(repo) = workspace.open()
         {
-            let recency =
-                git_recency::compute_git_recency(&repo, &self.git_recency_config, &self.base_path);
+            let recency = repo.recency(
+                &self.git_recency_config,
+                &workspace.git_path(&self.base_path),
+            );
             self.apply_git_recency(recency.as_ref());
         }
 
@@ -1667,9 +1788,14 @@ impl FilePicker {
         })
     }
 
-    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
-        self.sync_data = sync;
+    pub(crate) fn unchanged_text_files(&self, previous: &FileSync) -> Vec<u64> {
+        self.sync_data.unchanged_text_files(previous)
+    }
+
+    // Returns the replaced index so the caller can compare against it and drop it off the lock
+    pub(crate) fn commit_new_sync(&mut self, sync: FileSync) -> FileSync {
         self.cache_budget.reset();
+        std::mem::replace(&mut self.sync_data, sync)
     }
 
     #[inline]
@@ -1680,66 +1806,56 @@ impl FilePicker {
     /// Update git statuses for files, using the provided shared frecency tracker.
     pub(crate) fn update_git_statuses(
         &mut self,
-        status_cache: GitStatusCache,
+        status_cache: ScmStatusCache,
         shared_frecency: &SharedFrecency,
-    ) -> Result<(), Error> {
-        debug!(
-            statuses_count = status_cache.statuses_len(),
-            "Updating git status",
-        );
-
-        let mode = self.mode;
-        let bp = self.base_path.clone();
-        let shared_base = self.sync_data.shared_base.clone();
+    ) -> Result<usize, Error> {
+        let Some(workspace) = &self.sync_data.git else {
+            return Ok(0);
+        };
+        let base = workspace.git_path(&self.base_path);
+        let subdir = base.strip_prefix(&workspace.workdir)?.to_string_lossy();
+        let subdir = crate::path_utils::to_canonical_slashes(&subdir);
+        let subdir = (!subdir.is_empty()).then_some(subdir.as_ref());
         let frecency = shared_frecency.read()?;
         let reader = frecency.as_ref().map(FrecencyTracker::reader);
-
-        let mut directories =
-            (status_cache.statuses_len() >= 8192).then(AHashMap::<String, Option<usize>>::new);
-        status_cache
-            .into_iter()
-            .try_for_each(|(path, status)| -> Result<(), Error> {
-                let index = if let Some(cache) = directories.as_mut() {
-                    self.sync_data.find_file_index_with(&path, &bp, |dir| {
-                        if let Some(&index) = cache.get(dir) {
-                            return index;
-                        }
-                        let index = self.sync_data.find_base_dir_index(dir);
-                        cache.insert(dir.to_owned(), index);
-                        index
-                    })
-                } else {
-                    self.sync_data.find_file_index(&path, &bp)
-                };
-                if let Some((arena, file)) = index.and_then(|i| self.sync_data.get_file_mut(i)) {
-                    file.git_status = Some(status);
-                    if let Some(reader) = reader.as_ref() {
-                        file.update_frecency_scores(
-                            reader,
-                            arena,
-                            &bp,
-                            shared_base.as_deref(),
-                            mode,
-                        );
-                    }
-                    // Update parent dir frecency inline. `DirItem` has an
-                    // interior-mutable atomic score, so `&self` access is
-                    // enough — no write aliasing against Arc clones.
-                    let score = file.access_frecency_score as i32;
-                    let dir_idx = file.parent_dir_index as usize;
-                    if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
-                        dir.update_frecency_if_larger(score);
-                    }
-                } else {
-                    // Expected on sparse checkouts: git reports a status for
-                    // a path that isn't materialized on disk and therefore
-                    // isn't in the file index. Don't spam the log (#404).
-                    debug!(?path, "Git status for path not in index, skipping");
+        let shared_base = self.sync_data.shared_base.clone();
+        let mut last_dir = None;
+        let mut count = 0;
+        for (path, status) in status_cache.iter() {
+            count += 1;
+            let Some(path) = crate::path_utils::path_in_base(path, subdir) else {
+                continue;
+            };
+            let index = self.sync_data.find_by_relative_path_with(path, |dir| {
+                if let Some((previous, index)) = last_dir
+                    && dir == previous
+                {
+                    return index;
                 }
-                Ok(())
-            })?;
-
-        Ok(())
+                let index = self.sync_data.find_base_dir_index(dir);
+                last_dir = Some((dir, index));
+                index
+            });
+            let Some((arena, file)) = index.and_then(|i| self.sync_data.get_file_mut(i)) else {
+                continue;
+            };
+            file.git_status = Some(status);
+            if let Some(reader) = &reader {
+                file.update_frecency_scores(
+                    reader,
+                    arena,
+                    &self.base_path,
+                    shared_base.as_deref(),
+                    self.mode,
+                );
+            }
+            let score = file.access_frecency_score as i32;
+            let dir_idx = file.parent_dir_index as usize;
+            if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
+                dir.update_frecency_if_larger(score);
+            }
+        }
+        Ok(count)
     }
 
     // Replaces every recency score with a freshly computed set. `None` zeroes
@@ -2164,7 +2280,7 @@ impl Drop for FilePicker {
         self.signals.cancelled.store(true, Ordering::Release);
         // Wake the git-status consumer so it exits; never joined (it takes
         // the picker write lock, a blocking join here could deadlock).
-        self.git_status_worker.signal_shutdown();
+        self.scm_status_worker.signal_shutdown();
     }
 }
 
@@ -2229,11 +2345,18 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
-    pub(crate) fn discover_git(base_path: &Path) -> Option<GitDiscovery> {
-        let git = GitDiscovery::discover(base_path);
+    pub(crate) fn discover_scm(
+        backend: ScmBackend,
+        base_path: &Path,
+        disabled: bool,
+    ) -> Option<ScmWorkspace> {
+        if disabled {
+            return None;
+        }
+        let git = backend.discover(base_path);
         match &git {
             Some(git) => {
-                debug!(workdir = ?git.workdir, git_dir = ?git.git_dir, "Git repository found")
+                debug!(workdir = ?git.workdir, metadata = ?git.metadata, "Git repository found")
             }
             None => warn!("No git repository found for path: {}", base_path.display()),
         }
@@ -2241,33 +2364,25 @@ impl FileSync {
         git
     }
 
-    pub(crate) fn spawn_git_status(git_workdir: PathBuf) -> JoinHandle<Option<GitStatusCache>> {
-        std::thread::spawn(move || {
-            GitStatusCache::read_git_status(
-                Some(git_workdir.as_path()),
-                &mut crate::git::initial_scan_status_options(),
-            )
-        })
-    }
-
     /// Returns files immediately (searchable) and a handle to the in-progress
     /// git status computation. This avoids blocking on `git status` which can
     /// take 10+ seconds on very large repos (e.g. chromium).
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, name = "walk_filesystem", level = Level::INFO)]
     pub(crate) fn walk_filesystem(
         base_path: &Path,
-        git: Option<GitDiscovery>,
+        git: Option<ScmWorkspace>,
         synced_files_count: &Arc<AtomicUsize>,
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
         follow_symlinks: bool,
         show_hidden: bool,
+        ignore_options: &FilePickerIgnoreOptions,
     ) -> Result<FileSync, Error> {
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
 
         // Walk files (the fast part, typically 2-3s even on huge repos).
-        let is_git_repo = git.is_some();
         let shared_base = git.as_ref().and_then(|git| git.shared_base(base_path));
         if let Some(shared_base) = &shared_base {
             info!(
@@ -2275,7 +2390,8 @@ impl FileSync {
                 "Linked git worktree, sharing the main checkout history"
             );
         }
-        let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
+        let pool = indexing_pool();
+        let walk_threads = pool.current_num_threads();
 
         let WalkOutput {
             dirs: mut walked_dirs,
@@ -2283,16 +2399,18 @@ impl FileSync {
             ignore_rules,
         } = crate::walk::walk_collect_files(
             base_path,
-            is_git_repo,
+            git.as_ref().map(|workspace| workspace.backend),
             follow_symlinks,
             show_hidden,
-            bg_threads,
+            walk_threads,
             synced_files_count,
+            ignore_options,
+            None,
         )?;
         let ignore_rules = ignore_rules.map(Arc::new);
 
         // group walked dirs and files with a dir part to the same order
-        BACKGROUND_THREAD_POOL.install(|| {
+        pool.install(|| {
             rayon::join(
                 || {
                     pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
@@ -2324,7 +2442,7 @@ impl FileSync {
         if let Some(frecency) = frecency.as_ref() {
             let dirs_ref = &dirs;
             let shared_base = shared_base.as_deref();
-            BACKGROUND_THREAD_POOL.install(|| {
+            pool.install(|| {
                 files.par_iter_mut().for_each_init(
                     || frecency.reader(),
                     |reader, file| {
@@ -2342,33 +2460,27 @@ impl FileSync {
         }
         drop(frecency);
 
-        // un-indexable files that are binary or not fitting the size cap has to beplaced in the end
+        // Preserve the existing (parent_dir, filename) order within both partitions.
         let is_indexable = |f: &FileItem| {
             !f.is_binary()
                 && f.size > 0
                 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
-        BACKGROUND_THREAD_POOL.install(|| {
-            files.par_sort_unstable_by(|a, b| {
-                (!is_indexable(a))
-                    .cmp(&!is_indexable(b))
-                    // this just makes it faster in terms of allocation - we store the dir indexes
-                    .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
-                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
-            });
-        });
-        let indexable_count = files.partition_point(is_indexable);
+        let indexable_count = files.iter().filter(|file| is_indexable(file)).count();
+        let mut unindexable = Vec::with_capacity(files.len() - indexable_count);
+        unindexable.extend(files.extract_if(.., |file| !is_indexable(file)));
+        files.extend(unindexable);
 
         // Ask the allocator to return freed pages to the OS.
-        hint_allocator_collect();
+        hint_allocator_collect(pool);
 
         let file_item_size = std::mem::size_of::<FileItem>();
         let files_vec_bytes = files.len() * file_item_size;
         let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
             + dirs
                 .iter()
-                .map(|d| d.relative_path(arena).len())
+                .map(|d| usize::from(d.path.byte_len))
                 .sum::<usize>();
 
         let total_time = scan_start.elapsed();
@@ -2488,7 +2600,7 @@ fn populates_dirs_files_chunked_storage<'a>(
             prev_dir = dir_part;
         }
 
-        file.path = chunk_storage.add_file_immediate(rel, file.path.filename_offset);
+        file.path = chunk_storage.add_file_with_parent(rel, &dirs[current_dir_idx as usize].path);
         file.parent_dir_index = current_dir_idx;
     }
 
@@ -2676,13 +2788,13 @@ pub extern "C" fn tune_mimalloc() {
 /// Ask the global allocator to return freed pages to the OS.
 /// Enabled via the `mimalloc-collect` feature (set by fff-nvim).
 /// No-op when the feature is off (tests, system allocator).
-pub(crate) fn hint_allocator_collect() {
+pub(crate) fn hint_allocator_collect(pool: &rayon::ThreadPool) {
+    #[cfg(not(feature = "mimalloc-collect"))]
+    let _ = pool;
     #[cfg(feature = "mimalloc-collect")]
     {
-        // Collect BACKGROUND_THREAD_POOL workers — that's where the bigram
-        // builder allocated memory. `rayon::broadcast` would target the global
-        // pool, which is the wrong set of threads.
-        BACKGROUND_THREAD_POOL.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+        // Collect the indexing pool workers, where the bigram builder allocated.
+        pool.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
 
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };

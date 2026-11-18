@@ -1,7 +1,8 @@
+use crate::file_picker::FilePickerIgnoreOptions;
 use crate::ignore::non_git_repo_overrides;
+use crate::scm::is_metadata_path;
 use crate::types::FileItem;
-use crate::walk::WalkOutput;
-use crate::watch::is_git_file;
+use crate::walk::{WalkIgnoreRules, WalkOutput};
 use ignore::WalkBuilder;
 use std::path::Path;
 use std::sync::{
@@ -9,21 +10,22 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "ripgrep walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
-    is_git_repo: bool,
+    backend: Option<crate::scm::ScmBackend>,
     follow_symlinks: bool,
     show_hidden: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
+    _ignore_options: &FilePickerIgnoreOptions,
+    _scope: Option<&Path>,
 ) -> crate::Result<WalkOutput> {
     let mut walk_builder = WalkBuilder::new(base_path);
     walk_builder
-        // this is a very important guard for the user opening ~/ or other root non-git dir.
-        // `show_hidden` only relaxes it outside a git repo — git roots already show hidden
-        // files today (gated solely by .gitignore/.git_exclude/.git_global below).
-        .hidden(!is_git_repo && !show_hidden)
+        // Keep non-git roots bounded unless hidden files were explicitly requested.
+        .hidden(backend.is_none() && !show_hidden)
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true)
@@ -31,7 +33,9 @@ pub(crate) fn walk_collect_files(
         .follow_links(follow_symlinks)
         .threads(threads);
 
-    if !is_git_repo && let Some(overrides) = non_git_repo_overrides(base_path) {
+    if backend.is_none()
+        && let Some(overrides) = non_git_repo_overrides(base_path)
+    {
         walk_builder.overrides(overrides);
     }
 
@@ -56,7 +60,7 @@ pub(crate) fn walk_collect_files(
 
                 // Ignore walkers sometimes surface files inside `.git/`
                 // when the base is itself a git repo — skip them.
-                if is_git_file(path) {
+                if is_metadata_path(path, backend) {
                     return ignore::WalkState::Continue;
                 }
 
@@ -68,7 +72,7 @@ pub(crate) fn walk_collect_files(
                 counter.fetch_add(1, Ordering::Relaxed);
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
-                if !is_git_file(path)
+                if !is_metadata_path(path, backend)
                     && let Ok(rel) = path.strip_prefix(&base_path)
                 {
                     let mut rel = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy())
@@ -85,6 +89,9 @@ pub(crate) fn walk_collect_files(
     Ok(WalkOutput {
         pairs,
         dirs,
-        ignore_rules: None,
+        // Ripgrep lets .ignore re-include hidden entries in a non-Git root.
+        ignore_rules: backend.is_none().then(|| WalkIgnoreRules {
+            inner: walk_builder.build_matchers().pop().expect("one walk root"),
+        }),
     })
 }

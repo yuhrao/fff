@@ -1,10 +1,12 @@
 use crate::file_picker::{
-    is_ambiguous_binary_name, is_known_binary_extension_basename, starts_with_binary_content,
+    FilePickerIgnoreOptions, is_ambiguous_binary_name, is_known_binary_extension_basename,
+    starts_with_binary_content,
 };
 use crate::ignore::IGNORED_DIRS;
 use crate::types::FileItem;
 use crate::walk::{WalkIgnoreRules, WalkOutput};
 use parking_lot::Mutex;
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,21 +15,35 @@ use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
 
 const PROGRESS_STEP: usize = 13;
 
+// Keep adjacent workers' locks and vector headers on separate cache lines.
+#[repr(align(128))]
+#[derive(Default)]
+struct WorkerFiles {
+    pairs: Vec<(FileItem, String)>,
+    dirs: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
 pub(crate) fn walk_collect_files(
     base_path: &Path,
-    is_git_repo: bool,
+    backend: Option<crate::scm::ScmBackend>,
     follow_symlinks: bool,
     show_hidden: bool,
     threads: usize,
     synced_files_count: &Arc<AtomicUsize>,
+    ignore_options: &FilePickerIgnoreOptions,
+    scope: Option<&Path>,
 ) -> crate::Result<WalkOutput> {
-    // gitignore on; skip hidden on non-git roots (so `~/` doesn't recurse into
-    // ~/.cache, ~/.config, etc.) unless the caller opted into `show_hidden`;
-    // optionally follow symlinks. Git roots already show hidden files today,
-    // gated solely by gitignore, regardless of `show_hidden`.
+    let use_non_git_defaults = backend.is_none() && !ignore_options.disable_git;
     let mut flags = WalkFlags::GITIGNORE;
-    if !is_git_repo && !show_hidden {
+    if ignore_options.disable_git {
+        flags |= WalkFlags::SKIP_GITIGNORE | WalkFlags::NO_GIT_EXCLUDE | WalkFlags::NO_GIT_GLOBAL;
+    }
+    if ignore_options.disable_ignore_files {
+        flags |= WalkFlags::SKIP_DOT_IGNORE;
+    }
+    if use_non_git_defaults && !show_hidden {
         flags |= WalkFlags::SKIP_HIDDEN;
     }
     if follow_symlinks {
@@ -42,21 +58,56 @@ pub(crate) fn walk_collect_files(
         // Bulk-fetch the only metadata FileItem needs; zlob never stats more.
         .metadata(WalkMetadata::SIZE | WalkMetadata::MTIME);
 
-    if !is_git_repo
-        && !IGNORED_DIRS.is_empty()
-        && let Err(e) = builder.extra_ignore(IGNORED_DIRS)
-    {
-        // Interior NUL in one of the extra_ignore patterns would fail
-        // here — treat as if no extras were supplied rather than
-        // aborting the whole walk.
-        tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
+    let extra_ignore = &ignore_options.extra_ignore;
+    let defaults = if use_non_git_defaults {
+        IGNORED_DIRS
+    } else {
+        &[]
+    };
+    if !defaults.is_empty() || !extra_ignore.is_empty() {
+        let rules: Vec<_> = defaults
+            .iter()
+            .copied()
+            .chain(extra_ignore.iter().map(String::as_str))
+            .collect();
+        builder
+            .extra_ignore(&rules)
+            .map_err(|e| crate::Error::WalkFailed(format!("invalid extra ignore rules: {e:?}")))?;
     }
 
-    // Single lock for both collections: every entry is either a file or a
-    // dir, so this keeps one mutex acquisition per entry.
-    let collected = Mutex::new((Vec::new(), Vec::new()));
+    let collected: Vec<Mutex<WorkerFiles>> = (0..builder.max_workers())
+        .map(|_| Mutex::default())
+        .collect();
+    synced_files_count.store(0, Ordering::Relaxed);
 
+    // zlob already excludes .git during traversal.
+    let extra_metadata = backend
+        .map(|backend| backend.metadata_dir_name())
+        .filter(|name| *name != ".git");
     let outcome = match builder.run(|entry| {
+        if extra_metadata.is_some_and(|name| {
+            entry
+                .path()
+                .components()
+                .any(|component| component.as_os_str() == name)
+        }) {
+            return WalkState::Continue;
+        }
+        let collected = &collected[entry.worker_id()];
+        if ignore_options.disable_git && entry.path().file_name().is_some_and(|name| name == ".git")
+        {
+            return WalkState::SkipDir;
+        }
+        if let Some(scope) = scope {
+            let path = entry.path();
+            if scope.starts_with(path) {
+                return WalkState::Continue;
+            }
+            if !path.starts_with(scope) {
+                return WalkState::SkipDir;
+            }
+        }
+
         // Followed links keep the Symlink kind and lstat metadata, so stat
         // the target to index the ones resolving to files (#912).
         let target = if entry.is_file() {
@@ -71,9 +122,16 @@ pub(crate) fn walk_collect_files(
             if entry.is_dir() {
                 let relative_path = entry.relative_path_lossy();
                 if !relative_path.is_empty() {
-                    let mut relative_path = relative_path.into_owned();
+                    let mut relative_path = match relative_path {
+                        Cow::Borrowed(path) => {
+                            let mut relative_path = String::with_capacity(path.len() + 1);
+                            relative_path.push_str(path);
+                            relative_path
+                        }
+                        Cow::Owned(path) => path,
+                    };
                     relative_path.push('/');
-                    collected.lock().1.push(relative_path);
+                    collected.lock().dirs.push(relative_path);
                 }
             }
 
@@ -92,6 +150,9 @@ pub(crate) fn walk_collect_files(
             None => entry.basename().unwrap_or(""),
             Some(_) => &relative_path[basename_offset..],
         };
+        if basename == ".git" {
+            return WalkState::Continue;
+        }
         let is_binary = is_known_binary_extension_basename(basename)
             && (!is_ambiguous_binary_name(basename) || starts_with_binary_content(entry.path()));
 
@@ -117,35 +178,38 @@ pub(crate) fn walk_collect_files(
         item.mark_definition_language(basename);
 
         let mut guard = collected.lock();
-        guard.0.push((item, relative_path));
-        let n = guard.0.len();
+        guard.pairs.push((item, relative_path));
+        let n = guard.pairs.len();
         drop(guard);
 
-        if n % PROGRESS_STEP == 0 {
-            synced_files_count.store(n, Ordering::Relaxed);
+        if n.is_multiple_of(PROGRESS_STEP) {
+            synced_files_count.fetch_add(PROGRESS_STEP, Ordering::Relaxed);
         }
 
         WalkState::Continue
     }) {
         Ok(outcome) => outcome,
         Err(e) => {
-            // Preserve whatever we collected before the failure so the caller
-            // can still surface a partial index instead of nothing.
             tracing::error!(?e, "zlob walk failed");
             return Err(crate::Error::WalkFailed(format!("{e:?}")));
         }
     };
 
-    let (pairs, dirs) = collected.into_inner();
+    let collected: Vec<_> = collected.into_iter().map(Mutex::into_inner).collect();
+    let mut pairs = Vec::with_capacity(collected.iter().map(|shard| shard.pairs.len()).sum());
+    let mut dirs = Vec::with_capacity(collected.iter().map(|shard| shard.dirs.len()).sum());
+    for mut shard in collected {
+        pairs.append(&mut shard.pairs);
+        dirs.append(&mut shard.dirs);
+    }
     // Always report the exact final total regardless of the last step.
     synced_files_count.store(pairs.len(), Ordering::Relaxed);
 
-    // Retain the ignore rules only when the walk actually gathered some
-    // (git roots with .gitignore/.ignore). Otherwise callers fall back.
-    let ignore_rules = outcome
-        .rules()
-        .is_some()
-        .then(|| WalkIgnoreRules { inner: outcome });
+    let ignore_rules =
+        (use_non_git_defaults || outcome.rules().is_some()).then_some(WalkIgnoreRules {
+            inner: outcome,
+            skip_hidden: use_non_git_defaults && !show_hidden,
+        });
 
     Ok(WalkOutput {
         pairs,

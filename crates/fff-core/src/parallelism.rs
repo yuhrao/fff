@@ -1,16 +1,10 @@
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Dedicated thread pool for background work (scan, warmup, bigram build).
 pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    let total = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-
-    // Background work is mostly syscall-bound; halving parallelism leaves
-    // cores for search/UI at negligible throughput cost.
-    let bg_threads = (total / 2).max(2);
     rayon::ThreadPoolBuilder::new()
-        .num_threads(bg_threads)
+        .num_threads(background_thread_count())
         .thread_name(|i| format!("fff-bg-{i}"))
         .start_handler(|_| {
             // Request user-initiated scheduling priority.
@@ -26,7 +20,7 @@ pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|
         .expect("failed to create background rayon pool")
 });
 
-/// Grep pool sized to non-efficiency cores on macOS and full parallelism elsewhere.
+/// Search pool sized to non-efficiency cores on macOS and full parallelism elsewhere.
 pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     #[cfg(target_os = "macos")]
     let threads = non_efficiency_core_count();
@@ -50,6 +44,31 @@ pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .build()
         .expect("failed to create search rayon pool")
 });
+
+/// Background work is mostly syscall-bound; halving parallelism leaves
+/// cores for search/UI at negligible throughput cost.
+pub fn background_thread_count() -> usize {
+    let total = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+    (total / 2).max(2)
+}
+
+static FULL_PARALLEL_INDEXING: AtomicBool = AtomicBool::new(false);
+
+/// Index on the search pool (all cores, performance cores on macOS) instead of half the
+/// cores. Faster on large repos, but searches queue behind indexing. Applies to later scans.
+pub fn set_full_parallel_indexing(enabled: bool) {
+    FULL_PARALLEL_INDEXING.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn indexing_pool() -> &'static rayon::ThreadPool {
+    if FULL_PARALLEL_INDEXING.load(Ordering::Relaxed) {
+        &SEARCH_THREAD_POOL
+    } else {
+        &BACKGROUND_THREAD_POOL
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn non_efficiency_core_count() -> usize {

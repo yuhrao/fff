@@ -39,7 +39,7 @@
 
         # zlob requires Zig >= 0.16, but nixpkgs tops out at 0.15. Pull from
         # mitchellh/zig-overlay which ships every released version.
-        zig = zig-overlay.packages.${system}."0.16.0";
+        zig = zig-overlay.packages.${system}."0.17.1";
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
@@ -95,6 +95,16 @@
           }
         );
 
+        nvimArgs = commonArgs // { cargoExtraArgs = "-p fff-nvim --lib"; };
+
+        nvim-library = craneLib.buildPackage (
+          nvimArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly nvimArgs;
+            doCheck = false;
+          }
+        );
+
         fff-mcp-args = commonArgs // {
           pname = fffMcpCargoToml.package.name;
           version = fffMcpCargoToml.package.version;
@@ -114,16 +124,16 @@
           set -eo pipefail
           mkdir -p target/release
           if [ "$(uname)" = "Darwin" ]; then
-            cp -vf ${my-crate}/lib/libfff_nvim.dylib target/release/libfff_nvim.dylib
+            cp -vf ${nvim-library}/lib/libfff_nvim.dylib target/release/libfff_nvim.dylib
           else
-            cp -vf ${my-crate}/lib/libfff_nvim.so target/release/libfff_nvim.so
+            cp -vf ${nvim-library}/lib/libfff_nvim.so target/release/libfff_nvim.so
           fi
           echo "Library copied to target/release/"
         '';
       in
       {
         checks = {
-          inherit my-crate fff-mcp;
+          inherit my-crate nvim-library fff-mcp;
         };
 
         packages = {

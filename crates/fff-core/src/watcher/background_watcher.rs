@@ -1,17 +1,18 @@
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
-use crate::file_picker::FFFMode;
-use crate::git::GitDiscovery;
-use crate::git_status_worker::GitStatusWorker;
+use crate::file_picker::{FFFMode, FilePickerIgnoreOptions};
+use crate::parallelism::indexing_pool;
 use crate::rescan_stats::RescanReason;
+use crate::scm::ScmStatusWorker;
+use crate::scm::{ScmRepository, ScmWorkspace};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
 use crate::watch::{RawWatchEvent, WatchEventKind};
-use git2::Repository;
 use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
-use notify::{Config, EventKind, EventKindMask, RecursiveMode};
+use notify::{Config, EventKind, EventKindMask, PathOp, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use parking_lot::Mutex;
+use rayon::slice::ParallelSliceMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -26,6 +27,16 @@ pub struct BackgroundWatcher {
     debouncer: Arc<Mutex<Option<Debouncer>>>,
     watch_tx: Option<mpsc::Sender<WatchTask>>,
     owner_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct WatcherOptions {
+    pub(crate) mode: FFFMode,
+    pub(crate) follow_symlinks: bool,
+    pub(crate) show_hidden: bool,
+    pub(crate) ignore_options: FilePickerIgnoreOptions,
+    pub(crate) enable_fs_root_scanning: bool,
+    pub(crate) enable_home_dir_scanning: bool,
 }
 
 enum WatchTask {
@@ -43,22 +54,19 @@ const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
 const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
 
 impl BackgroundWatcher {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         base_path: PathBuf,
-        git: Option<GitDiscovery>,
+        git: Option<ScmWorkspace>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
-        mode: FFFMode,
-        enable_fs_root_scanning: bool,
-        enable_home_dir_scanning: bool,
-        git_status_worker: Arc<GitStatusWorker>,
+        options: WatcherOptions,
+        scm_status_worker: Arc<dyn ScmStatusWorker>,
         trace_span: tracing::Span,
     ) -> Result<Self, Error> {
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
             base_path.display(),
-            mode,
+            options.mode,
         );
 
         // by default we do not want to allow users to search their FS root, this is very error prone
@@ -68,7 +76,9 @@ impl BackgroundWatcher {
         // use rust's path api for maximum reliability of the comparison
         let is_home_dir = Some(&base_path) == dirs::home_dir().as_ref();
 
-        if (is_fs_root && !enable_fs_root_scanning) || (is_home_dir && !enable_home_dir_scanning) {
+        if (is_fs_root && !options.enable_fs_root_scanning)
+            || (is_home_dir && !options.enable_home_dir_scanning)
+        {
             return Err(Error::FilesystemRoot(base_path));
         }
 
@@ -93,18 +103,20 @@ impl BackgroundWatcher {
 
         let owner_weak_picker = shared_picker.weaken();
         let owner_frecency = shared_frecency.clone();
-        let owner_git_workdir = git.as_ref().map(|git| git.workdir.clone());
-        let owner_git_worker = Arc::clone(&git_status_worker);
+        let owner_base_path = base_path.clone();
+        let owner_options = options.clone();
+        let owner_git_workdir = git.clone();
+        let owner_git_worker = Arc::clone(&scm_status_worker);
 
         let debouncer = Self::create_debouncer(
             base_path,
             git,
             shared_picker,
             shared_frecency,
-            mode,
+            options,
             use_recursive,
             watch_tx_for_debouncer,
-            git_status_worker,
+            scm_status_worker,
         )?;
 
         info!("Background file watcher initialized successfully");
@@ -142,6 +154,8 @@ impl BackgroundWatcher {
                         // new folders to the picker, but on linux we have to handle the subdirs
                         let subdirs = index_new_directory(
                             &dir,
+                            &owner_base_path,
+                            &owner_options,
                             &strong_picker,
                             &owner_frecency,
                             &owner_git_workdir,
@@ -177,13 +191,13 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
-        git: Option<GitDiscovery>,
+        git: Option<ScmWorkspace>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
-        mode: FFFMode,
+        options: WatcherOptions,
         use_recursive: bool,
         watch_tx: mpsc::Sender<WatchTask>,
-        git_status_worker: Arc<GitStatusWorker>,
+        scm_status_worker: Arc<dyn ScmStatusWorker>,
     ) -> Result<Debouncer, Error> {
         let config = Config::default()
             .with_follow_symlinks(false)
@@ -191,7 +205,7 @@ impl BackgroundWatcher {
             // our own grep calls and preview window rendering
             .with_event_kinds(EventKindMask::CORE);
 
-        let git_workdir_for_handler = git.as_ref().map(|git| git.workdir.clone());
+        let git_workdir_for_handler = git.clone();
         let base_path_for_handler = base_path.clone();
         let shared_picker_for_watching = shared_picker.clone();
         let file_picker = shared_picker.weaken();
@@ -206,13 +220,13 @@ impl BackgroundWatcher {
                         };
 
                         let new_dirs = handle_debounced_events(
-                            mode,
+                            &options,
                             events,
                             &base_path_for_handler,
                             &git_workdir_for_handler,
                             &file_picker,
                             &shared_frecency,
-                            &git_status_worker,
+                            &scm_status_worker,
                         );
 
                         // every new directory created has to be reflected in the picker state
@@ -249,39 +263,65 @@ impl BackgroundWatcher {
             let mut watched = 0usize;
             let mut consecutive_failures = 0usize;
 
-            // `inotify` is fast-fail: on ENOSPC it returns
-            // immediately, no kernel retry loop, so holding this lock is free
+            let mut directories = Vec::new();
             if let Some(guard) = shared_picker_for_watching.read().ok()
                 && let Some(picker) = guard.as_ref()
             {
-                use std::ops::ControlFlow;
                 picker.for_each_dir(|dir| {
-                    match debouncer.watch(dir, RecursiveMode::NonRecursive) {
+                    directories.push(PathOp::watch_non_recursive(dir));
+                    std::ops::ControlFlow::Continue(())
+                });
+            }
+            // The debouncer keeps sorted roots; append in order and register off-lock.
+            indexing_pool().install(|| {
+                directories.par_sort_unstable_by(|left, right| left.as_path().cmp(right.as_path()));
+            });
+            let mut directories = directories.into_iter();
+            'register: loop {
+                let mut batch = directories.by_ref().take(1024).collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                loop {
+                    let batch_len = batch.len();
+                    match debouncer.update_paths(batch) {
                         Ok(()) => {
-                            watched += 1;
+                            watched += batch_len;
                             consecutive_failures = 0;
-                            ControlFlow::Continue(())
+                            break;
                         }
-                        Err(e) => {
+                        Err(error) => {
+                            let applied = batch_len.saturating_sub(
+                                error.remaining.len() + usize::from(error.origin.is_some()),
+                            );
+                            watched += applied;
+                            if applied > 0 {
+                                consecutive_failures = 0;
+                            }
                             consecutive_failures += 1;
                             if consecutive_failures <= 4 {
-                                warn!("Failed to watch directory {}: {}", dir.display(), e);
+                                warn!(
+                                    error = %error.source,
+                                    path = ?error.origin.as_ref().map(PathOp::as_path),
+                                    watched,
+                                    "Failed to register directory watch"
+                                );
                             }
-
                             if consecutive_failures >= MAX_CONSECUTIVE_WATCH_FAILURES {
                                 warn!(
                                     consecutive_failures,
                                     watched,
                                     "Giving up setting file watcher for all the directories. Check if your system has enough fs watchers limit."
                                 );
-
-                                ControlFlow::Break(())
-                            } else {
-                                ControlFlow::Continue(())
+                                break 'register;
+                            }
+                            batch = error.remaining;
+                            if batch.is_empty() {
+                                break;
                             }
                         }
                     }
-                });
+                }
             }
 
             tracing::info!(
@@ -294,10 +334,15 @@ impl BackgroundWatcher {
         // The .git directory is excluded from the file list but we still need
         // to observe changes that affect git status (staging, unstaging,
         // committing, branch switches, merges, etc)
-        watch_git_status_paths(
-            &mut debouncer,
-            git.as_ref().map(|git| git.git_dir.as_path()),
-        );
+        if let Some(git) = git {
+            for dir in git.backend.watch_dirs(&git.metadata) {
+                if dir.is_dir()
+                    && let Err(error) = debouncer.watch(&dir, RecursiveMode::NonRecursive)
+                {
+                    warn!(?dir, %error, "Failed to watch SCM metadata");
+                }
+            }
+        }
 
         Ok(debouncer)
     }
@@ -330,25 +375,29 @@ impl Drop for BackgroundWatcher {
     }
 }
 
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_worker), level = Level::DEBUG)]
+#[tracing::instrument(name = "fs_events", skip(options, events, shared_picker, shared_frecency, scm_status_worker), fields(mode = ?options.mode), level = Level::DEBUG)]
 pub(crate) fn handle_debounced_events(
-    mode: FFFMode,
+    options: &WatcherOptions,
     events: Vec<DebouncedEvent>,
     base_path: &Path,
-    git_workdir: &Option<PathBuf>,
+    git_workdir: &Option<ScmWorkspace>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
-    git_status_worker: &Arc<GitStatusWorker>,
+    scm_status_worker: &Arc<dyn ScmStatusWorker>,
 ) -> Vec<PathBuf> {
-    // this will be called very often, we have to minimiy the lock time for file picker
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
-    // per batch so we don't hold the picker lock during filtering.
+    let repo = git_workdir.as_ref().and_then(|p| p.open().ok());
+    let ignore_options = &options.ignore_options;
+    // Clone the latest walker's rules once per batch to release the lock before filtering.
     let walker_rules = shared_picker
         .read()
         .ok()
         .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
-    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
+    let mut filter = IgnoreFilter::new(
+        base_path,
+        walker_rules,
+        repo.as_ref().zip(git_workdir.as_ref()),
+        ignore_options.disable_git,
+    );
     let mut need_full_git_rescan = false;
     let mut batch_overflow_attempted = false;
     let mut paths_to_remove = Vec::new();
@@ -398,7 +447,7 @@ pub(crate) fn handle_debounced_events(
                     .paths
                     .iter()
                     // but we are smart enough and not falling into the paths
-                    .all(|p| !p.is_dir() && !filter.is_ignored(p));
+                    .all(|p| !p.is_dir() && !filter.is_ignored(p, false));
 
             if !small_and_known && try_trigger_full_rescan(RescanReason::KernelEventLoss) {
                 return Vec::new();
@@ -419,13 +468,15 @@ pub(crate) fn handle_debounced_events(
         }
 
         for path in &debounced_event.event.paths {
-            if matches!(
-                path.file_name().and_then(|f| f.to_str()),
-                Some(".ignore") | Some(".gitignore")
-            ) {
+            let ignore_file_changed = match path.file_name().and_then(|f| f.to_str()) {
+                Some(".ignore") => !ignore_options.disable_ignore_files,
+                Some(".gitignore") => !ignore_options.disable_git,
+                _ => false,
+            };
+            if ignore_file_changed {
                 if path
                     .parent()
-                    .is_some_and(|parent| filter.is_ignored(parent))
+                    .is_some_and(|parent| filter.is_ignored(parent, true))
                 {
                     continue;
                 }
@@ -443,15 +494,17 @@ pub(crate) fn handle_debounced_events(
                 // indexed; the stale rules heal on the next admitted rescan.
             }
 
-            if is_dotgit_change_affecting_status(path, &repo) {
+            if is_dotgit_change_affecting_status(path, git_workdir) {
                 need_full_git_rescan = true;
             }
 
             // bare repos keep worktree git dirs outside of any `.git` component
-            if is_git_file(path)
-                || repo
-                    .as_ref()
-                    .is_some_and(|repo| path.starts_with(repo.path()))
+            if crate::scm::is_metadata_path(
+                path,
+                git_workdir.as_ref().map(|workspace| workspace.backend),
+            ) || git_workdir
+                .as_ref()
+                .is_some_and(|workspace| workspace.git_path(path).starts_with(&workspace.metadata))
             {
                 continue;
             }
@@ -483,7 +536,8 @@ pub(crate) fn handle_debounced_events(
             let (is_dir, is_ignored) = if is_removed {
                 (false, true)
             } else {
-                (path.is_dir(), filter.is_ignored(path))
+                let is_dir = path.is_dir();
+                (is_dir, filter.is_ignored(path, is_dir))
             };
 
             if is_folder_removal {
@@ -736,7 +790,7 @@ pub(crate) fn handle_debounced_events(
     // Uses a 5-minute cooldown per file to prevent score inflation from rapid
     // burst edits (AI agents often edit the same file many times in minutes).
     // This runs after apply_changes so the picker write lock is released.
-    if mode.is_ai() && !paths_to_add_or_modify.is_empty() {
+    if options.mode.is_ai() && !paths_to_add_or_modify.is_empty() {
         let mut tracked_count = 0usize;
         let shared_base = shared_picker.read().ok().and_then(|guard| {
             guard
@@ -760,7 +814,7 @@ pub(crate) fn handle_debounced_events(
 
                 let shared = shared_base
                     .as_deref()
-                    .and_then(|shared_base| crate::git::shared_twin(path, base_path, shared_base));
+                    .and_then(|shared_base| crate::scm::shared_twin(path, base_path, shared_base));
                 if let Err(e) = frecency.track_access_shared(path, shared.as_deref()) {
                     error!("Failed to track frecency for {:?}: {:?}", path, e);
                 } else {
@@ -791,9 +845,9 @@ pub(crate) fn handle_debounced_events(
         if need_full_git_rescan {
             // A full git rescan re-reads every tracked path (including ones that just
             // went clean after a commit), so it already subsumes the per-path update.
-            git_status_worker.request_full_rescan();
+            scm_status_worker.request_full_rescan();
         } else if !files_to_update_git_status.is_empty() {
-            git_status_worker.enqueue_paths(files_to_update_git_status);
+            scm_status_worker.enqueue_paths(files_to_update_git_status);
         }
     }
 
@@ -802,35 +856,39 @@ pub(crate) fn handle_debounced_events(
 
 fn index_new_directory(
     dir: &Path,
+    base_path: &Path,
+    options: &WatcherOptions,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
-    git_workdir: &Option<PathBuf>,
-    git_status_worker: &Arc<GitStatusWorker>,
+    git_workdir: &Option<ScmWorkspace>,
+    scm_status_worker: &Arc<dyn ScmStatusWorker>,
 ) -> Vec<PathBuf> {
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    // Prefer the walker's ignore rules; read base_path + rules from the picker.
-    let (base_path, walker_rules, follow_symlinks, show_hidden) =
-        match shared_picker.read().ok().and_then(|g| {
-            g.as_ref().map(|p| {
-                (
-                    p.base_path().to_path_buf(),
-                    p.ignore_rules(),
-                    p.follows_symlinks(),
-                    p.shows_hidden(),
-                )
-            })
-        }) {
-            Some(triple) => triple,
-            None => return Vec::new(),
-        };
+    let repo = git_workdir.as_ref().and_then(|p| p.open().ok());
+    let Some(walker_rules) = shared_picker
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|p| p.ignore_rules()))
+    else {
+        return Vec::new();
+    };
+    let ignore_options = &options.ignore_options;
+
+    // Walk from the original root when caller patterns depend on that root.
+    let (walk_base, scope) = if ignore_options.extra_ignore.is_empty() {
+        (dir, None)
+    } else {
+        (base_path, Some(dir))
+    };
 
     let walk = match crate::walk::walk_collect_files(
-        dir,
-        repo.is_some(),
-        follow_symlinks,
-        show_hidden,
+        walk_base,
+        git_workdir.as_ref().map(|workspace| workspace.backend),
+        options.follow_symlinks,
+        options.show_hidden,
         1,
         &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ignore_options,
+        scope,
     ) {
         Ok(walk) => walk,
         Err(e) => {
@@ -839,24 +897,28 @@ fn index_new_directory(
         }
     };
 
-    // TODO: figure out a better optimized way for zlob to rerun the directory walk using existing
-    // ignore rules, but currently we have to filter out ignored files on our own
-    let filter = IgnoreFilter::new(&base_path, walker_rules, repo.as_ref());
-    let join_unless_ignored = |relative_path: &str| -> Option<PathBuf> {
-        let path = dir.join(relative_path);
-        (!filter.is_ignored(&path)).then_some(path)
+    // Subtree-rooted walks still need to check the original root's ignore rules.
+    let mut filter = IgnoreFilter::new(
+        base_path,
+        walker_rules,
+        repo.as_ref().zip(git_workdir.as_ref()),
+        ignore_options.disable_git,
+    );
+    let mut join_unless_ignored = |relative_path: &str, is_dir: bool| -> Option<PathBuf> {
+        let path = walk_base.join(relative_path);
+        (scope.is_some() || !filter.is_ignored(&path, is_dir)).then_some(path)
     };
 
     let files_to_add: Vec<PathBuf> = walk
         .pairs
         .iter()
-        .filter_map(|(_, path)| join_unless_ignored(path))
+        .filter_map(|(_, path)| join_unless_ignored(path, false))
         .collect();
 
     let subdirs: Vec<PathBuf> = walk
         .dirs
         .iter()
-        .filter_map(|path| join_unless_ignored(path.trim_end_matches('/')))
+        .filter_map(|path| join_unless_ignored(path.trim_end_matches('/'), true))
         .collect();
 
     if files_to_add.is_empty() {
@@ -890,7 +952,7 @@ fn index_new_directory(
     let rescan_started = if index_update_rejected {
         match shared_picker.trigger_full_rescan_async(shared_frecency) {
             Ok(()) => {
-                watch_registry.dispatch_rescan(&base_path);
+                watch_registry.dispatch_rescan(base_path);
                 true
             }
             Err(e) => {
@@ -913,11 +975,11 @@ fn index_new_directory(
             })
             .collect();
 
-        watch_registry.dispatch(&base_path, events);
+        watch_registry.dispatch(base_path, events);
     }
 
     if !rescan_started && repo.is_some() {
-        git_status_worker.enqueue_paths(indexed_files);
+        scm_status_worker.enqueue_paths(indexed_files);
     }
 
     debug!(
@@ -954,39 +1016,41 @@ fn watch_dirs_nonrecursive<'a>(
 
 struct IgnoreFilter<'a> {
     base_path: &'a Path,
-    /// Reusable ignore rules from the last walk (zlob backend only).
+    // Ignore rules from the last walk.
     rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
-    /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
-    /// caller's repo (also used for git-status queries) to avoid re-opening.
-    repo: Option<&'a Repository>,
+    // Consult the active repository when the walker has no cached rules.
+    repo: Option<(&'a ScmRepository, &'a ScmWorkspace)>,
+    disable_git: bool,
 }
 
 impl<'a> IgnoreFilter<'a> {
     fn new(
         base_path: &'a Path,
         rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
-        repo: Option<&'a Repository>,
+        repo: Option<(&'a ScmRepository, &'a ScmWorkspace)>,
+        disable_git: bool,
     ) -> Self {
         Self {
             base_path,
             rules,
             repo,
+            disable_git,
         }
     }
 
-    /// Whether `path` (absolute) is ignored.
-    fn is_ignored(&self, path: &Path) -> bool {
-        if let Some(rules) = self.rules.as_ref() {
+    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        if let Some(rules) = self.rules.as_mut() {
             let Ok(relative) = path.strip_prefix(self.base_path) else {
                 return false;
             };
-            // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
-            // layer internally, so a leaf under an ignored directory (rule
-            // `build/`, path `build/out.rs`) is caught in one call.
-            return rules.is_ignored(relative);
+            // Ripgrep caches directory rules. Start each batch with the unloaded matcher.
+            #[cfg(not(feature = "zlob"))]
+            let rules = Arc::make_mut(rules);
+            return rules.is_ignored(relative, is_dir);
         }
         match self.repo {
-            Some(repo) => repo.is_path_ignored(path) == Ok(true),
+            Some((repo, workspace)) => repo.is_ignored(&workspace.git_path(path)),
+            None if self.disable_git => false,
             // No repo and no rules: the non-code-dir heuristic, applied to the
             // base-relative path so ancestors of the base (e.g. a temp dir
             // under AppData/Local on Windows) never match.
@@ -997,76 +1061,13 @@ impl<'a> IgnoreFilter<'a> {
     }
 }
 
-#[inline]
-pub(crate) fn is_git_file(path: &Path) -> bool {
-    // it could be in submodule
-    path.components()
-        .any(|component| component.as_os_str() == ".git")
-}
-
-fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) -> bool {
-    let Some(repo) = repo.as_ref() else {
-        return false;
-    };
-
-    let git_dir = repo.path();
-
-    if let Ok(path_in_git_dir) = changed.strip_prefix(git_dir) {
-        // Only react to changes that rewrite the worktree state: commits,
-        // staging, checkouts, merges, conflict resolution. Ref-only updates
-        // under refs/ (fetch, push, tag writes, pack-refs) do not change
-        // which files are modified/untracked, so we deliberately skip them
-        // watching refs/ recursively would cost one inotify watch per ref
-        // namespace on repos with many branches/remotes.
-        if path_in_git_dir == Path::new("index") || path_in_git_dir == Path::new("index.lock") {
-            return true;
-        }
-
-        if path_in_git_dir == Path::new("HEAD") {
-            return true;
-        }
-
-        // some of the git ops are not involving nethier index nor HEAD change, or sometimes
-        // index updates can arrive too late after the change - that's why we track the log
-        // the actual user action, once user
-        if path_in_git_dir == Path::new("logs/HEAD") {
-            return true;
-        }
-
-        if let Some(fname) = path_in_git_dir.file_name().and_then(|f| f.to_str())
-            && matches!(fname, "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD")
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-// `git_dir` is `.git/worktrees/<name>` for linked worktrees, whose `.git` is a file.
-fn watch_git_status_paths(debouncer: &mut Debouncer, git_dir: Option<&Path>) {
-    let Some(git_dir) = git_dir.filter(|git_dir| git_dir.is_dir()) else {
-        return;
-    };
-
-    // We have tried to be smart about the internal git state but
-    // it appeared more harmful that it's worth it, so we just watch
-    // for the most obvious paths like HEAD, MERGE_HEAD, index.lock
-    if let Err(e) = debouncer.watch(git_dir, RecursiveMode::NonRecursive) {
-        warn!("Failed to watch .git directory: {}", e);
-    }
-
-    // `.git` above is non-recursive, so on Linux (per-dir inotify watches)
-    // events for `logs/HEAD` — the commit-finished signal used by
-    // `is_dotgit_change_affecting_status` — would never be delivered without
-    // watching `.git/logs` itself. On macOS/Windows the recursive base watch
-    // already covers it; an extra watch is harmless there.
-    let logs_dir = git_dir.join("logs");
-    if logs_dir.is_dir()
-        && let Err(e) = debouncer.watch(&logs_dir, RecursiveMode::NonRecursive)
-    {
-        warn!("Failed to watch .git/logs directory: {}", e);
-    }
+fn is_dotgit_change_affecting_status(changed: &Path, workspace: &Option<ScmWorkspace>) -> bool {
+    workspace.as_ref().is_some_and(|workspace| {
+        workspace
+            .git_path(changed)
+            .strip_prefix(&workspace.metadata)
+            .is_ok_and(|relative| workspace.backend.status_metadata_changed(relative))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1232,6 +1233,54 @@ mod tests {
     }
 
     #[test]
+    fn new_directory_preserves_show_hidden_and_ignore_rules() {
+        for show_hidden in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+            std::fs::write(base.join(".ignore"), "blocked.txt\n").unwrap();
+            let shared_picker = SharedFilePicker::default();
+            let mut picker = FilePicker::new(FilePickerOptions {
+                base_path: base.to_string_lossy().into_owned(),
+                show_hidden,
+                watch: false,
+                ..Default::default()
+            })
+            .unwrap();
+            picker.collect_files().unwrap();
+            *shared_picker.write().unwrap() = Some(picker);
+
+            let dir = base.join("new-directory");
+            std::fs::create_dir_all(dir.join(".config")).unwrap();
+            for name in ["visible.txt", ".env", ".config/settings.txt", "blocked.txt"] {
+                std::fs::write(dir.join(name), "content").unwrap();
+            }
+            index_new_directory(
+                &dir,
+                &base,
+                &WatcherOptions {
+                    show_hidden,
+                    ..Default::default()
+                },
+                &shared_picker,
+                &SharedFrecency::noop(),
+                &None,
+                &crate::scm::ScmBackend::configured().create_worker(Arc::default()),
+            );
+
+            let guard = shared_picker.read().unwrap();
+            let picker = guard.as_ref().unwrap();
+            assert!(picker.get_file_by_path(dir.join("visible.txt")).is_some());
+            assert!(picker.get_file_by_path(dir.join("blocked.txt")).is_none());
+            for name in [".env", ".config/settings.txt"] {
+                assert_eq!(
+                    picker.get_file_by_path(dir.join(name)).is_some(),
+                    show_hidden
+                );
+            }
+        }
+    }
+
+    #[test]
     fn new_directory_overflow_rescans_every_file() {
         let tmp = tempfile::tempdir().unwrap();
         let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
@@ -1265,10 +1314,12 @@ mod tests {
         }
         index_new_directory(
             &dir,
+            &base,
+            &WatcherOptions::default(),
             &shared_picker,
             &SharedFrecency::noop(),
             &None,
-            &GitStatusWorker::new(),
+            &crate::scm::ScmBackend::configured().create_worker(Arc::default()),
         );
         {
             let guard = shared_picker.read().unwrap();
@@ -1354,13 +1405,13 @@ mod tests {
         ];
 
         handle_debounced_events(
-            FFFMode::Neovim,
+            &WatcherOptions::default(),
             events,
             &base,
             &None,
             &shared_picker,
             &shared_frecency,
-            &GitStatusWorker::new(),
+            &crate::scm::ScmBackend::configured().create_worker(Arc::default()),
         );
 
         let received = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1475,12 +1526,19 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "libgit2", feature = "gitoxide"))]
     #[test]
     fn dotgit_status_filter_matches_worktree_state_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(tmp.path()).unwrap();
-        let git_dir = repo.path().to_path_buf();
-        let repo = Some(repo);
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let workspace = ScmWorkspace::discover(tmp.path()).unwrap();
+        let git_dir = workspace.metadata.clone();
+        let repo = Some(workspace);
 
         let affecting = ["index", "index.lock", "HEAD", "logs/HEAD", "MERGE_HEAD"];
         for p in affecting {
